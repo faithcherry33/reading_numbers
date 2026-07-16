@@ -239,7 +239,7 @@ function numberStringToKorean(numberString) {
 }
 
 function formatNumber(numberString) {
-  return numberString.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return numberString;
 }
 
 function createQuestion(channel) {
