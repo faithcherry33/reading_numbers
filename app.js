@@ -395,7 +395,39 @@ function startHeartbeat() {
 }
 
 async function cleanupStalePresence() {
-  async function cleanupStaleMatch(channelId = state.channel?.id) {
+  if (!state.firebaseReady || !state.channel) return;
+
+  try {
+    const snapshot = await getDocs(
+      collection(
+        state.db,
+        FIREBASE_COLLECTIONS.rooms,
+        state.channel.id,
+        "presence"
+      )
+    );
+
+    const cutoff = Date.now() - 120000;
+
+    const deletions = snapshot.docs
+      .filter(
+        (item) =>
+          (item.data().lastSeenMs || 0) < cutoff
+      )
+      .map((item) => deleteDoc(item.ref));
+
+    await Promise.allSettled(deletions);
+  } catch (error) {
+    console.warn(
+      "오래된 접속자 정리 실패",
+      error
+    );
+  }
+}
+
+async function cleanupStaleMatch(
+  channelId = state.channel?.id
+) {
   if (!state.firebaseReady || !channelId) return;
 
   const matchRef = doc(
@@ -407,111 +439,134 @@ async function cleanupStalePresence() {
   const now = Date.now();
 
   try {
-    await runTransaction(state.db, async (transaction) => {
-      const snapshot = await transaction.get(matchRef);
+    await runTransaction(
+      state.db,
+      async (transaction) => {
+        const snapshot =
+          await transaction.get(matchRef);
 
-      if (!snapshot.exists()) return;
+        if (!snapshot.exists()) return;
 
-      const match = snapshot.data();
+        const match = snapshot.data();
 
-      /*
-       * 아직 초대 기능을 적용하기 전이므로 waiting은 현재 없지만,
-       * 다음 단계에서 사용할 수 있도록 미리 처리합니다.
-       */
-      if (match.status === "waiting") {
-        const proposalTime =
-          match.proposalUpdatedAtMs ||
-          match.createdAtMs ||
-          0;
+        /*
+         * 아직 초대 기능을 적용하기 전이므로
+         * waiting은 현재 없지만,
+         * 다음 단계에서 사용합니다.
+         */
+        if (match.status === "waiting") {
+          const proposalTime =
+            match.proposalUpdatedAtMs ||
+            match.createdAtMs ||
+            0;
 
-        if (
-          proposalTime &&
-          now - proposalTime >= MATCH_INACTIVITY_LIMIT_MS
-        ) {
-          transaction.delete(matchRef);
+          if (
+            proposalTime &&
+            now - proposalTime >=
+              MATCH_INACTIVITY_LIMIT_MS
+          ) {
+            transaction.delete(matchRef);
+          }
+
+          return;
         }
 
-        return;
-      }
+        if (match.status !== "playing") return;
 
-      if (match.status !== "playing") return;
+        const participantIds =
+          match.participantIds || [];
 
-      const participantIds = match.participantIds || [];
-      const eliminated = match.eliminated || {};
-      const lastActivityAtMs = match.lastActivityAtMs || {};
+        const eliminated =
+          match.eliminated || {};
 
-      /*
-       * 수정 전에 만들어진 옛 대결에는 lastActivityAtMs가 없습니다.
-       * 이런 대결이 3분 이상 멈춰 있으면 문서를 삭제하여
-       * 전날 대결 때문에 방이 영구 잠기는 문제를 해제합니다.
-       */
-      const isLegacyMatch =
-        participantIds.length > 0 &&
-        Object.keys(lastActivityAtMs).length === 0;
+        const lastActivityAtMs =
+          match.lastActivityAtMs || {};
 
-      if (isLegacyMatch) {
-        const legacyLastTime =
-          match.questionStartedAtMs ||
-          match.startsAtMs ||
-          match.createdAtMs ||
-          0;
+        /*
+         * 수정 전에 만들어진 옛 대결에는
+         * lastActivityAtMs가 없습니다.
+         */
+        const isLegacyMatch =
+          participantIds.length > 0 &&
+          Object.keys(lastActivityAtMs).length === 0;
 
-        if (
-          legacyLastTime &&
-          now - legacyLastTime >= MATCH_INACTIVITY_LIMIT_MS
-        ) {
-          transaction.delete(matchRef);
+        if (isLegacyMatch) {
+          const legacyLastTime =
+            match.questionStartedAtMs ||
+            match.startsAtMs ||
+            match.createdAtMs ||
+            0;
+
+          if (
+            legacyLastTime &&
+            now - legacyLastTime >=
+              MATCH_INACTIVITY_LIMIT_MS
+          ) {
+            transaction.delete(matchRef);
+          }
+
+          return;
         }
 
-        return;
-      }
+        const inactiveIds =
+          participantIds.filter((uid) => {
+            if (eliminated[uid]) return false;
 
-      const inactiveIds = participantIds.filter((uid) => {
-        if (eliminated[uid]) return false;
+            const lastActivity =
+              lastActivityAtMs[uid] ||
+              match.startedAtMs ||
+              match.startsAtMs ||
+              match.createdAtMs ||
+              now;
 
-        const lastActivity =
-          lastActivityAtMs[uid] ||
-          match.startedAtMs ||
-          match.startsAtMs ||
-          match.createdAtMs ||
-          now;
+            return (
+              now - lastActivity >=
+              MATCH_INACTIVITY_LIMIT_MS
+            );
+          });
 
-        return (
-          now - lastActivity >= MATCH_INACTIVITY_LIMIT_MS
+        if (!inactiveIds.length) return;
+
+        const nextEliminated = {
+          ...eliminated
+        };
+
+        const updates = {};
+
+        inactiveIds.forEach((uid) => {
+          nextEliminated[uid] = true;
+
+          updates[`eliminated.${uid}`] = true;
+          updates[`eliminatedAtMs.${uid}`] = now;
+          updates[`exitReasons.${uid}`] =
+            "inactive-3-minutes";
+        });
+
+        const remainingActiveCount =
+          participantIds.filter(
+            (uid) => !nextEliminated[uid]
+          ).length;
+
+        if (remainingActiveCount === 0) {
+          updates.status = "finished";
+          updates.finishedAt =
+            serverTimestamp();
+          updates.finishedAtMs = now;
+          updates.finishedReason =
+            "all-players-inactive";
+        }
+
+        transaction.update(
+          matchRef,
+          updates
         );
-      });
-
-      if (!inactiveIds.length) return;
-
-      const nextEliminated = {
-        ...eliminated
-      };
-
-      const updates = {};
-
-      inactiveIds.forEach((uid) => {
-        nextEliminated[uid] = true;
-
-        updates[`eliminated.${uid}`] = true;
-        updates[`eliminatedAtMs.${uid}`] = now;
-        updates[`exitReasons.${uid}`] = "inactive-3-minutes";
-      });
-
-      const remainingActiveCount = participantIds.filter(
-        (uid) => !nextEliminated[uid]
-      ).length;
-
-      if (remainingActiveCount === 0) {
-        updates.status = "finished";
-        updates.finishedAt = serverTimestamp();
-        updates.finishedAtMs = now;
-        updates.finishedReason = "all-players-inactive";
       }
-
-      transaction.update(matchRef, updates);
-    });
+    );
   } catch (error) {
-    console.warn("오래된 대결 정리 실패", error);
+    console.warn(
+      "오래된 대결 정리 실패",
+      error
+    );
   }
 }
 
@@ -526,25 +581,10 @@ function startMatchCleanup() {
 
   cleanupStaleMatch().catch(console.warn);
 
-  state.matchCleanupId = window.setInterval(() => {
-    cleanupStaleMatch().catch(console.warn);
-  }, MATCH_CLEANUP_INTERVAL_MS);
-}
-
-  try {
-    const snapshot = await getDocs(
-      collection(state.db, FIREBASE_COLLECTIONS.rooms, state.channel.id, "presence")
-    );
-    const cutoff = Date.now() - 120000;
-
-    const deletions = snapshot.docs
-      .filter((item) => (item.data().lastSeenMs || 0) < cutoff)
-      .map((item) => deleteDoc(item.ref));
-
-    await Promise.allSettled(deletions);
-  } catch (error) {
-    console.warn("오래된 접속자 정리 실패", error);
-  }
+  state.matchCleanupId =
+    window.setInterval(() => {
+      cleanupStaleMatch().catch(console.warn);
+    }, MATCH_CLEANUP_INTERVAL_MS);
 }
 
 function subscribeToPresence() {
