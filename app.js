@@ -1011,13 +1011,39 @@ async function advanceQuestion(roundId, questionIndex) {
     }
 
     if (questionIndex >= 19) {
-      transaction.update(matchRef, {
-        status: "finished",
-        finishedAt: serverTimestamp(),
-        finishedAtMs: Date.now()
-      });
-      return;
+  const now = Date.now();
+
+  const updates = {
+    status: "finished",
+    finishedAt: serverTimestamp(),
+    finishedAtMs: now,
+    finishedReason: "completed"
+  };
+
+  const participantIds =
+    match.participantIds || [];
+
+  const eliminated =
+    match.eliminated || {};
+
+  const hasSubmitted =
+    match.hasSubmitted || {};
+
+  participantIds.forEach((uid) => {
+    if (
+      !eliminated[uid] &&
+      !hasSubmitted[uid]
+    ) {
+      updates[`eliminated.${uid}`] = true;
+      updates[`eliminatedAtMs.${uid}`] = now;
+      updates[`exitReasons.${uid}`] =
+        "no-submission-by-finish";
     }
+  });
+
+  transaction.update(matchRef, updates);
+  return;
+}
 
     transaction.update(matchRef, {
       questionIndex: questionIndex + 1,
@@ -1187,23 +1213,56 @@ function renderScores() {
 
 async function handleElimination(match) {
   state.handledEliminations.add(match.roundId);
+
   sessionStorage.setItem(
     "handledEliminations",
-    JSON.stringify([...state.handledEliminations].slice(-20))
+    JSON.stringify(
+      [...state.handledEliminations].slice(-20)
+    )
   );
 
   const score = match.scores?.[state.uid] || 0;
+  const reason = match.exitReasons?.[state.uid];
+
+  const isInactive =
+    reason === "inactive-3-minutes";
+
+  const eyebrow = isInactive
+    ? "INACTIVITY"
+    : "HARD MODE";
+
+  const description = isInactive
+    ? "3분 동안 답을 제출하지 않아 대결에서 자동 퇴장되었습니다."
+    : "0점인 상태에서 오답을 한 번 더 입력했습니다.";
+
   await leaveRoom({ forced: true });
 
-  openModal(`
-    <p class="eyebrow">HARD MODE</p>
-    <h2>대결에서 퇴장되었습니다.</h2>
-    <p class="subtext">0점인 상태에서 오답을 한 번 더 입력했습니다.</p>
-    <div class="notice-box">현재 점수: ${score}점<br>다시 참가하려면 단계별 방에 다시 입장하세요.</div>
-    <button id="elimination-confirm" class="primary-button" type="button">방 선택으로 돌아가기</button>
-  `, { closable: false });
+  openModal(
+    `
+      <p class="eyebrow">${eyebrow}</p>
 
-  $("#elimination-confirm").addEventListener("click", closeModal);
+      <h2>대결에서 퇴장되었습니다.</h2>
+
+      <p class="subtext">${description}</p>
+
+      <div class="notice-box">
+        현재 점수: ${score}점<br>
+        다시 참가하려면 단계별 방에 다시 입장하세요.
+      </div>
+
+      <button
+        id="elimination-confirm"
+        class="primary-button"
+        type="button"
+      >
+        방 선택으로 돌아가기
+      </button>
+    `,
+    { closable: false }
+  );
+
+  $("#elimination-confirm")
+    .addEventListener("click", closeModal);
 }
 
 async function handleFinishedRound(match) {
@@ -1217,19 +1276,59 @@ async function handleFinishedRound(match) {
     (a, b) => (match.scores?.[b.uid] || 0) - (match.scores?.[a.uid] || 0)
   );
 
-  const resultItems = sorted.map((participant, index) => `
-    <li>
-      <span>${index + 1}위 · ${escapeHtml(participant.nickname)}</span>
-      <strong>${match.scores?.[participant.uid] || 0}점</strong>
-    </li>
-  `).join("");
+  const resultItems = sorted
+  .map((participant, index) => {
+    const reason =
+      match.exitReasons?.[participant.uid];
+
+    let statusText = "";
+
+    if (reason === "inactive-3-minutes") {
+      statusText = " · 3분 무입력 퇴장";
+    } else if (
+      reason === "no-submission-by-finish"
+    ) {
+      statusText = " · 미참여";
+    } else if (
+      match.eliminated?.[participant.uid]
+    ) {
+      statusText = " · 탈락";
+    }
+
+    return `
+      <li>
+        <span>
+          ${index + 1}위 ·
+          ${escapeHtml(participant.nickname)}
+          ${statusText}
+        </span>
+
+        <strong>
+          ${match.scores?.[participant.uid] || 0}점
+        </strong>
+      </li>
+    `;
+  })
+  .join("");
 
   await leaveRoom({ forced: true });
 
+const endedByInactivity =
+  match.finishedReason ===
+  "all-players-inactive";
+
+const resultTitle = endedByInactivity
+  ? "대결이 자동 종료되었습니다."
+  : "20문제 대결이 끝났습니다.";
+
+const resultDescription = endedByInactivity
+  ? "모든 참가자가 3분 동안 답을 제출하지 않아 대결이 종료되었습니다."
+  : "참가자는 모두 방에서 퇴장되었습니다.";
+  
   openModal(`
     <p class="eyebrow">ROUND FINISHED</p>
-    <h2>20문제 대결이 끝났습니다.</h2>
-    <p class="subtext">참가자는 모두 방에서 퇴장되었습니다.</p>
+    <h2>${resultTitle}</h2>
+    <p class="subtext">${resultDescription}</p>
     <ol class="result-list">${resultItems}</ol>
     <button id="result-confirm" class="primary-button" type="button">방 선택으로 돌아가기</button>
   `, { closable: false });
