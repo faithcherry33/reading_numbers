@@ -474,10 +474,15 @@ async function cleanupStaleMatch(
         if (match.status !== "playing") return;
 
         const participantIds =
-          match.participantIds || [];
+  match.participantIds || [];
 
-        const eliminated =
-          match.eliminated || {};
+if (participantIds.length === 0) {
+  transaction.delete(matchRef);
+  return;
+}
+
+const eliminated =
+  match.eliminated || {};
 
         const lastActivityAtMs =
           match.lastActivityAtMs || {};
@@ -637,13 +642,28 @@ function subscribeToMatch() {
 
       const isParticipant = match.participantIds?.includes(state.uid);
       const isEliminated = Boolean(match.eliminated?.[state.uid]);
+      const eliminatedAtMs =
+  match.eliminatedAtMs?.[state.uid] || 0;
 
+const recentlyEliminated =
+  eliminatedAtMs > 0 &&
+  Date.now() - eliminatedAtMs < 60 * 1000;
+
+const finishedAtMs =
+  match.finishedAtMs || 0;
+
+const recentlyFinished =
+  finishedAtMs > 0 &&
+  Date.now() - finishedAtMs < 60 * 1000;
+      
       if (
-        match.status === "playing" &&
-        isParticipant &&
-        !isEliminated &&
-        !state.handledRoundIds.has(match.roundId)
-      ) {
+  match.status === "playing" &&
+  isParticipant &&
+  isEliminated &&
+  recentlyEliminated &&
+  !state.handledEliminations.has(match.roundId)
+)) 
+      {
         if (state.mode !== "battle") {
           await setPresenceMode("battle");
         }
@@ -661,10 +681,12 @@ function subscribeToMatch() {
       }
 
       if (
-        match.status === "finished" &&
-        isParticipant &&
-        !state.handledRoundIds.has(match.roundId)
-      ) {
+  match.status === "finished" &&
+  isParticipant &&
+  recentlyFinished &&
+  !state.handledRoundIds.has(match.roundId)
+)) 
+      {
         handleFinishedRound(match);
         return;
       }
@@ -1063,20 +1085,53 @@ async function submitBattleAnswer(event) {
 
   const rawAnswer = elements.battleAnswerInput.value;
   if (!isHangulOnlyAnswer(rawAnswer)) {
+  const activityMatchRef = doc(
+    state.db,
+    FIREBASE_COLLECTIONS.matches,
+    state.channel.id
+  );
+
   try {
-    await updateDoc(
-      doc(
-        state.db,
-        FIREBASE_COLLECTIONS.matches,
-        state.channel.id
-      ),
-      {
-        [`lastActivityAtMs.${state.uid}`]: Date.now(),
-        [`hasSubmitted.${state.uid}`]: true
+    await runTransaction(
+      state.db,
+      async (transaction) => {
+        const snapshot =
+          await transaction.get(activityMatchRef);
+
+        if (!snapshot.exists()) return;
+
+        const fresh = snapshot.data();
+
+        if (
+          fresh.roundId !== match.roundId ||
+          fresh.status !== "playing" ||
+          fresh.questionIndex !==
+            match.questionIndex ||
+          !fresh.participantIds?.includes(
+            state.uid
+          ) ||
+          fresh.eliminated?.[state.uid]
+        ) {
+          return;
+        }
+
+        transaction.update(
+          activityMatchRef,
+          {
+            [`lastActivityAtMs.${state.uid}`]:
+              Date.now(),
+
+            [`hasSubmitted.${state.uid}`]:
+              true
+          }
+        );
       }
     );
   } catch (error) {
-    console.warn("활동 시각 저장 실패", error);
+    console.warn(
+      "활동 시각 저장 실패",
+      error
+    );
   }
 
   setFeedback(
@@ -1099,11 +1154,16 @@ async function submitBattleAnswer(event) {
 
       const fresh = snapshot.data();
       if (
-        fresh.roundId !== match.roundId ||
-        fresh.status !== "playing" ||
-        fresh.questionIndex !== match.questionIndex ||
-        fresh.eliminated?.[state.uid]
-      ) {
+  fresh.roundId !== match.roundId ||
+  fresh.status !== "playing" ||
+  fresh.questionIndex !==
+    match.questionIndex ||
+  !fresh.participantIds?.includes(
+    state.uid
+  ) ||
+  fresh.eliminated?.[state.uid]
+) 
+      {
         return { type: "stale" };
       }
 
@@ -1158,10 +1218,12 @@ async function submitBattleAnswer(event) {
 };
 
       if (activeCount === 0) {
-        updates.status = "finished";
-        updates.finishedAt = serverTimestamp();
-        updates.finishedAtMs = Date.now();
-      }
+  updates.status = "finished";
+  updates.finishedAt = serverTimestamp();
+  updates.finishedAtMs = Date.now();
+  updates.finishedReason =
+    "all-players-eliminated";
+}
 
       transaction.update(matchRef, updates);
       return { type: "eliminated" };
@@ -1317,13 +1379,29 @@ const endedByInactivity =
   match.finishedReason ===
   "all-players-inactive";
 
-const resultTitle = endedByInactivity
-  ? "대결이 자동 종료되었습니다."
-  : "20문제 대결이 끝났습니다.";
+const endedByElimination =
+  match.finishedReason ===
+  "all-players-eliminated";
 
-const resultDescription = endedByInactivity
-  ? "모든 참가자가 3분 동안 답을 제출하지 않아 대결이 종료되었습니다."
-  : "참가자는 모두 방에서 퇴장되었습니다.";
+let resultTitle =
+  "20문제 대결이 끝났습니다.";
+
+let resultDescription =
+  "대결 결과를 확인하세요.";
+
+if (endedByInactivity) {
+  resultTitle =
+    "대결이 자동 종료되었습니다.";
+
+  resultDescription =
+    "모든 참가자가 3분 동안 답을 제출하지 않아 대결이 종료되었습니다.";
+} else if (endedByElimination) {
+  resultTitle =
+    "모든 참가자가 탈락했습니다.";
+
+  resultDescription =
+    "Hard 모드에서 활동 중인 참가자가 모두 탈락하여 대결이 종료되었습니다.";
+}
   
   openModal(`
     <p class="eyebrow">ROUND FINISHED</p>
