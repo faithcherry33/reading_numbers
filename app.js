@@ -30,6 +30,9 @@ const FIREBASE_COLLECTIONS = {
   matches: "numberReadingMatches"
 };
 
+const MATCH_INACTIVITY_LIMIT_MS = 3 * 60 * 1000;
+const MATCH_CLEANUP_INTERVAL_MS = 15 * 1000;
+
 const state = {
   nickname: "",
   firebaseReady: false,
@@ -41,6 +44,7 @@ const state = {
   presenceUnsubscribe: null,
   matchUnsubscribe: null,
   heartbeatId: null,
+  matchCleanupId: null,
   onlineUsers: [],
   match: null,
   soloQuestion: null,
@@ -281,10 +285,18 @@ async function enterRoom(channelId) {
   }
 
   await createOrUpdatePresence("idle");
-  subscribeToPresence();
-  subscribeToMatch();
-  startHeartbeat();
-  cleanupStalePresence();
+
+/*
+ * 구독하기 전에 전날 멈춘 대결을 먼저 정리합니다.
+ */
+await cleanupStaleMatch(channel.id);
+
+subscribeToPresence();
+subscribeToMatch();
+startHeartbeat();
+startMatchCleanup();
+
+cleanupStalePresence();
 }
 
 async function leaveRoom({ forced = false } = {}) {
@@ -322,6 +334,10 @@ function stopRoomListeners() {
   if (state.heartbeatId) {
     clearInterval(state.heartbeatId);
     state.heartbeatId = null;
+  }
+  if (state.matchCleanupId) {
+    clearInterval(state.matchCleanupId);
+    state.matchCleanupId = null;
   }
 }
 
@@ -379,7 +395,141 @@ function startHeartbeat() {
 }
 
 async function cleanupStalePresence() {
-  if (!state.firebaseReady || !state.channel) return;
+  async function cleanupStaleMatch(channelId = state.channel?.id) {
+  if (!state.firebaseReady || !channelId) return;
+
+  const matchRef = doc(
+    state.db,
+    FIREBASE_COLLECTIONS.matches,
+    channelId
+  );
+
+  const now = Date.now();
+
+  try {
+    await runTransaction(state.db, async (transaction) => {
+      const snapshot = await transaction.get(matchRef);
+
+      if (!snapshot.exists()) return;
+
+      const match = snapshot.data();
+
+      /*
+       * 아직 초대 기능을 적용하기 전이므로 waiting은 현재 없지만,
+       * 다음 단계에서 사용할 수 있도록 미리 처리합니다.
+       */
+      if (match.status === "waiting") {
+        const proposalTime =
+          match.proposalUpdatedAtMs ||
+          match.createdAtMs ||
+          0;
+
+        if (
+          proposalTime &&
+          now - proposalTime >= MATCH_INACTIVITY_LIMIT_MS
+        ) {
+          transaction.delete(matchRef);
+        }
+
+        return;
+      }
+
+      if (match.status !== "playing") return;
+
+      const participantIds = match.participantIds || [];
+      const eliminated = match.eliminated || {};
+      const lastActivityAtMs = match.lastActivityAtMs || {};
+
+      /*
+       * 수정 전에 만들어진 옛 대결에는 lastActivityAtMs가 없습니다.
+       * 이런 대결이 3분 이상 멈춰 있으면 문서를 삭제하여
+       * 전날 대결 때문에 방이 영구 잠기는 문제를 해제합니다.
+       */
+      const isLegacyMatch =
+        participantIds.length > 0 &&
+        Object.keys(lastActivityAtMs).length === 0;
+
+      if (isLegacyMatch) {
+        const legacyLastTime =
+          match.questionStartedAtMs ||
+          match.startsAtMs ||
+          match.createdAtMs ||
+          0;
+
+        if (
+          legacyLastTime &&
+          now - legacyLastTime >= MATCH_INACTIVITY_LIMIT_MS
+        ) {
+          transaction.delete(matchRef);
+        }
+
+        return;
+      }
+
+      const inactiveIds = participantIds.filter((uid) => {
+        if (eliminated[uid]) return false;
+
+        const lastActivity =
+          lastActivityAtMs[uid] ||
+          match.startedAtMs ||
+          match.startsAtMs ||
+          match.createdAtMs ||
+          now;
+
+        return (
+          now - lastActivity >= MATCH_INACTIVITY_LIMIT_MS
+        );
+      });
+
+      if (!inactiveIds.length) return;
+
+      const nextEliminated = {
+        ...eliminated
+      };
+
+      const updates = {};
+
+      inactiveIds.forEach((uid) => {
+        nextEliminated[uid] = true;
+
+        updates[`eliminated.${uid}`] = true;
+        updates[`eliminatedAtMs.${uid}`] = now;
+        updates[`exitReasons.${uid}`] = "inactive-3-minutes";
+      });
+
+      const remainingActiveCount = participantIds.filter(
+        (uid) => !nextEliminated[uid]
+      ).length;
+
+      if (remainingActiveCount === 0) {
+        updates.status = "finished";
+        updates.finishedAt = serverTimestamp();
+        updates.finishedAtMs = now;
+        updates.finishedReason = "all-players-inactive";
+      }
+
+      transaction.update(matchRef, updates);
+    });
+  } catch (error) {
+    console.warn("오래된 대결 정리 실패", error);
+  }
+}
+
+function startMatchCleanup() {
+  if (
+    !state.firebaseReady ||
+    !state.channel ||
+    state.matchCleanupId
+  ) {
+    return;
+  }
+
+  cleanupStaleMatch().catch(console.warn);
+
+  state.matchCleanupId = window.setInterval(() => {
+    cleanupStaleMatch().catch(console.warn);
+  }, MATCH_CLEANUP_INTERVAL_MS);
+}
 
   try {
     const snapshot = await getDocs(
@@ -669,9 +819,25 @@ async function startBattle(difficulty) {
     );
 
     const questions = Array.from({ length: 20 }, () => createQuestion(state.channel));
-    const scores = Object.fromEntries(participantIds.map((uid) => [uid, 0]));
-    const eliminated = Object.fromEntries(participantIds.map((uid) => [uid, false]));
-    const roundId = crypto.randomUUID();
+    const scores = Object.fromEntries(
+  participantIds.map((uid) => [uid, 0])
+);
+
+const eliminated = Object.fromEntries(
+  participantIds.map((uid) => [uid, false])
+);
+
+const battleStartTime = Date.now();
+
+const lastActivityAtMs = Object.fromEntries(
+  participantIds.map((uid) => [uid, battleStartTime])
+);
+
+const hasSubmitted = Object.fromEntries(
+  participantIds.map((uid) => [uid, false])
+);
+
+const roundId = crypto.randomUUID();
     const matchRef = doc(state.db, FIREBASE_COLLECTIONS.matches, state.channel.id);
 
     await runTransaction(state.db, async (transaction) => {
@@ -692,14 +858,18 @@ async function startBattle(difficulty) {
         participantIds,
         scores,
         eliminated,
+        lastActivityAtMs,
+        hasSubmitted,
+        exitReasons: {},
+        startedAtMs: battleStartTime,
         questions,
         questionIndex: 0,
         questionWinnerUid: null,
         questionWinnerNickname: null,
         createdAt: serverTimestamp(),
-        createdAtMs: Date.now(),
-        startsAtMs: Date.now() + 4000,
-        questionStartedAtMs: Date.now() + 4000
+        createdAtMs:  battleStartTime,
+        startsAtMs:  battleStartTime + 4000,
+        questionStartedAtMs:  battleStartTime + 4000
       });
     });
 
@@ -827,9 +997,30 @@ async function submitBattleAnswer(event) {
 
   const rawAnswer = elements.battleAnswerInput.value;
   if (!isHangulOnlyAnswer(rawAnswer)) {
-    setFeedback(elements.battleFeedback, "숫자나 기호 없이 한글로만 입력하세요.", "error");
-    return;
+  try {
+    await updateDoc(
+      doc(
+        state.db,
+        FIREBASE_COLLECTIONS.matches,
+        state.channel.id
+      ),
+      {
+        [`lastActivityAtMs.${state.uid}`]: Date.now(),
+        [`hasSubmitted.${state.uid}`]: true
+      }
+    );
+  } catch (error) {
+    console.warn("활동 시각 저장 실패", error);
   }
+
+  setFeedback(
+    elements.battleFeedback,
+    "숫자나 기호 없이 한글로만 입력하세요.",
+    "error"
+  );
+
+  return;
+}
 
   const expected = match.questions[match.questionIndex].answer;
   const correct = isExactAnswer(rawAnswer, expected);
@@ -850,13 +1041,22 @@ async function submitBattleAnswer(event) {
         return { type: "stale" };
       }
 
+      const activityUpdates = {
+  [`lastActivityAtMs.${state.uid}`]: Date.now(),
+  [`hasSubmitted.${state.uid}`]: true
+};
+
       if (correct) {
-        if (fresh.questionWinnerUid) return { type: "late" };
+        if (fresh.questionWinnerUid) {
+  transaction.update(matchRef, activityUpdates);
+  return { type: "late" };
+}
 
         const nextScore = (fresh.scores?.[state.uid] || 0) + 1;
         transaction.update(matchRef, {
-          [`scores.${state.uid}`]: nextScore,
-          questionWinnerUid: state.uid,
+  ...activityUpdates,
+  [`scores.${state.uid}`]: nextScore,
+  questionWinnerUid: state.uid,
           questionWinnerNickname: state.nickname,
           answerReceivedAt: serverTimestamp(),
           answerReceivedAtMs: Date.now()
@@ -866,14 +1066,16 @@ async function submitBattleAnswer(event) {
       }
 
       if (fresh.difficulty !== "hard") {
-        return { type: "wrong-easy" };
-      }
+  transaction.update(matchRef, activityUpdates);
+  return { type: "wrong-easy" };
+}
 
       const currentScore = fresh.scores?.[state.uid] || 0;
       if (currentScore > 0) {
         transaction.update(matchRef, {
-          [`scores.${state.uid}`]: currentScore - 1
-        });
+  ...activityUpdates,
+  [`scores.${state.uid}`]: currentScore - 1
+});
         return { type: "wrong-hard", score: currentScore - 1 };
       }
 
@@ -883,9 +1085,11 @@ async function submitBattleAnswer(event) {
       ).length;
 
       const updates = {
-        [`eliminated.${state.uid}`]: true,
-        [`eliminatedAtMs.${state.uid}`]: Date.now()
-      };
+  ...activityUpdates,
+  [`eliminated.${state.uid}`]: true,
+  [`eliminatedAtMs.${state.uid}`]: Date.now(),
+  [`exitReasons.${state.uid}`]: "hard-mistake"
+};
 
       if (activeCount === 0) {
         updates.status = "finished";
