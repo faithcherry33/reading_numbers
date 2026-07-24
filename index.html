@@ -1,105 +1,168 @@
 <!doctype html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="theme-color" content="#4f46e5" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#17213f">
   <title>한글 수 읽기 대결</title>
-  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./battle-final.css">
 </head>
 <body>
-  <main id="app">
-    <section id="nickname-screen" class="screen center-screen">
-      <div class="panel nickname-panel">
+  <main class="app-shell">
+    <section id="nickname-screen" class="screen nickname-screen">
+      <div class="hero-card nickname-card">
         <p class="eyebrow">숫자를 보고 한글로 빠르게!</p>
         <h1>한글 수 읽기 대결</h1>
         <p class="subtext">게임에서 사용할 닉네임을 입력하세요.</p>
-        <form id="nickname-form" class="stack">
+
+        <form id="nickname-form" class="nickname-form">
           <label for="nickname-input">닉네임</label>
           <input
             id="nickname-input"
+            name="nickname"
+            type="text"
             maxlength="12"
             autocomplete="off"
-            placeholder="예: 번개토끼"
             required
-          />
+          >
           <button class="primary-button" type="submit">게임 시작</button>
         </form>
       </div>
     </section>
 
-    <section id="channel-screen" class="screen hidden">
-      <header class="topbar">
+    <section id="channel-screen" class="screen channel-screen hidden">
+      <header class="page-header">
         <div>
           <p class="eyebrow">NUMBER READING GAME</p>
           <h1>한글 수 읽기 대결</h1>
         </div>
-        <div class="user-chip">
-          <span id="home-nickname"></span>
-          <button id="change-nickname-button" class="text-button" type="button">닉네임 변경</button>
+        <div class="header-actions">
+          <span id="home-nickname" class="nickname-badge"></span>
+          <button id="change-nickname-button" class="text-button" type="button">
+            닉네임 변경
+          </button>
         </div>
       </header>
 
-      <div class="hero panel">
-        <div>
-          <h2>도전할 수의 범위를 골라 보세요.</h2>
-          <p>각 단계의 방에서 혼자 연습하거나 친구들과 20문제 대결을 할 수 있습니다.</p>
+      <section class="panel channel-select-panel">
+        <div class="section-heading">
+          <div>
+            <h2>도전할 수의 범위를 골라 보세요.</h2>
+            <p>각 단계의 방에서 혼자 연습하거나 친구들과 20문제 대결을 할 수 있습니다.</p>
+          </div>
+          <span id="connection-badge" class="connection-badge">연결 확인 중</span>
         </div>
-        <div id="connection-badge" class="connection-badge">연결 확인 중</div>
-      </div>
 
-      <div id="channel-grid" class="channel-grid"></div>
+        <div id="channel-grid" class="channel-grid"></div>
+      </section>
 
-      <section class="rule-panel panel">
+      <section class="panel rules-panel">
         <h2>입력 규칙</h2>
         <p>
           숫자는 사용할 수 없으며, 정답은 한글로 입력해야 합니다.
           만·억·조처럼 큰 단위가 바뀔 때마다 한 칸 띄어쓰세요.
         </p>
-        <div class="example-box">
-          <span>예시</span>
-          <strong>201137905000011</strong>
-          <span>→</span>
-          <strong>이백일조 천삼백칠십구억 오천오백만 십일</strong>
+        <div class="notice-box">
+          예시 201137905000011 → 이백일조 천삼백칠십구억 오천오백만 십일
         </div>
       </section>
     </section>
 
-    <section id="room-screen" class="screen hidden">
-      <header class="topbar room-topbar">
+    <section id="room-screen" class="screen room-screen hidden">
+      <header class="room-header">
+        <button
+          id="leave-room-button"
+          class="back-button"
+          type="button"
+          aria-label="방 나가기"
+        >
+          ←
+        </button>
+
         <div class="room-title-wrap">
-          <button id="leave-room-button" class="back-button" type="button" aria-label="방 나가기">←</button>
-          <div>
-            <p id="room-range" class="eyebrow"></p>
-            <h1 id="room-title"></h1>
-          </div>
+          <h1 id="room-title"></h1>
+          <p id="room-range"></p>
         </div>
-        <div class="user-chip">
-          <span id="room-nickname"></span>
-        </div>
+
+        <span id="room-nickname" class="nickname-badge"></span>
       </header>
 
-      <div class="room-layout">
-        <section class="game-column">
-          <div id="room-status-banner" class="status-banner"></div>
+      <div id="room-status-banner" class="status-banner"></div>
 
+      <div class="room-layout">
+        <section class="room-main">
           <div id="mode-select-panel" class="panel mode-select-panel">
-            <h2>게임 방법을 선택하세요.</h2>
-            <div class="mode-buttons">
+            <div class="section-heading compact">
+              <div>
+                <p class="eyebrow">PLAY MODE</p>
+                <h2>게임 방법을 선택하세요.</h2>
+              </div>
+            </div>
+
+            <div class="mode-grid">
               <button id="solo-button" class="mode-card" type="button">
                 <span class="mode-icon">✏️</span>
                 <strong>혼자하기</strong>
                 <small>라운드 없이 계속 연습</small>
               </button>
-              <button id="battle-button" class="mode-card battle-card" type="button">
+
+              <button id="battle-button" class="mode-card battle-mode" type="button">
                 <span class="mode-icon">⚡</span>
                 <strong>대결하기</strong>
-                <small>접속자와 20문제 승부</small>
+                <small>참여를 수락한 친구들과 20문제 승부</small>
+              </button>
+            </div>
+          </div>
+
+          <div id="battle-lobby-panel" class="panel game-panel hidden">
+            <div class="game-header">
+              <div>
+                <p class="eyebrow">대결 준비</p>
+                <h2 id="battle-lobby-title">대결 제안을 확인하세요.</h2>
+              </div>
+              <span id="battle-accepted-count" class="count-pill">0명 참여</span>
+            </div>
+
+            <div id="battle-lobby-description" class="battle-lobby-summary"></div>
+
+            <div class="lobby-actions">
+              <button id="accept-battle-button" class="primary-button" type="button">
+                참여하기
+              </button>
+              <button
+                id="start-battle-button"
+                class="primary-button hidden"
+                type="button"
+                disabled
+              >
+                대결 시작
+              </button>
+              <button
+                id="cancel-battle-button"
+                class="secondary-button hidden"
+                type="button"
+              >
+                제안 취소
               </button>
             </div>
           </div>
 
           <div id="solo-panel" class="panel game-panel hidden">
+            <div id="solo-battle-invite" class="solo-battle-invite hidden">
+              <div>
+                <strong>대결 초대가 도착했습니다.</strong>
+                <p>혼자하기를 마치면 대결 참여 여부를 선택할 수 있습니다.</p>
+              </div>
+              <button
+                id="open-battle-invite-button"
+                class="secondary-button"
+                type="button"
+              >
+                혼자하기를 마치고 초대 보기
+              </button>
+            </div>
+
             <div class="game-header">
               <div>
                 <p class="eyebrow">혼자하기</p>
@@ -110,65 +173,79 @@
                 <span>시도 <strong id="solo-attempt-count">0</strong></span>
               </div>
             </div>
+
             <div id="solo-number" class="number-display"></div>
+
             <form id="solo-answer-form" class="answer-form">
-              <label for="solo-answer-input">한글 정답</label>
-              <div class="answer-row">
-                <input
-                  id="solo-answer-input"
-                  autocomplete="off"
-                  spellcheck="false"
-                  placeholder="큰 단위가 바뀌면 띄어쓰기"
-                />
-                <button class="primary-button" type="submit">확인</button>
-              </div>
-              <p id="solo-feedback" class="feedback" aria-live="polite"></p>
+              <label class="sr-only" for="solo-answer-input">한글 정답</label>
+              <input
+                id="solo-answer-input"
+                type="text"
+                placeholder="한글 정답"
+                autocomplete="off"
+              >
+              <button class="primary-button" type="submit">확인</button>
             </form>
+
+            <p id="solo-feedback" class="feedback"></p>
+
             <button id="stop-solo-button" class="secondary-button" type="button">
               혼자하기 그만두기
             </button>
           </div>
 
-          <div id="battle-panel" class="panel game-panel hidden">
-            <div class="battle-header">
+          <div id="battle-panel" class="panel game-panel battle-panel hidden">
+            <div class="game-header battle-game-header">
               <div>
                 <p id="battle-mode-label" class="eyebrow"></p>
                 <h2 id="battle-progress">1 / 20</h2>
               </div>
-              <div id="countdown-box" class="countdown-box hidden"></div>
+
+              <div class="battle-header-actions">
+                <span id="difficulty-pill" class="difficulty-pill"></span>
+                <button
+                  id="battle-exit-button"
+                  class="danger-button compact-button"
+                  type="button"
+                >
+                  대결 퇴장
+                </button>
+              </div>
             </div>
 
-            <div id="battle-number" class="number-display"></div>
+            <div id="battle-number" class="number-display battle-number"></div>
+
             <form id="battle-answer-form" class="answer-form">
-              <label for="battle-answer-input">한글 정답</label>
-              <div class="answer-row">
-                <input
-                  id="battle-answer-input"
-                  autocomplete="off"
-                  spellcheck="false"
-                  placeholder="정확한 한글과 띄어쓰기"
-                />
-                <button id="battle-submit-button" class="primary-button" type="submit">제출</button>
-              </div>
-              <p id="battle-feedback" class="feedback" aria-live="polite"></p>
+              <label class="sr-only" for="battle-answer-input">한글 정답</label>
+              <input
+                id="battle-answer-input"
+                type="text"
+                placeholder="한글 정답"
+                autocomplete="off"
+              >
+              <button id="battle-submit-button" class="primary-button" type="submit">
+                제출
+              </button>
             </form>
+
+            <p id="battle-feedback" class="feedback"></p>
             <div id="winner-message" class="winner-message hidden"></div>
+            <div id="countdown-box" class="countdown-box hidden"></div>
           </div>
         </section>
 
-        <aside class="sidebar">
-          <section class="panel users-panel">
-            <div class="sidebar-title">
+        <aside class="room-sidebar">
+          <section class="panel sidebar-panel">
+            <div class="sidebar-heading">
               <h2>현재 접속자</h2>
               <span id="online-count" class="count-pill">0명</span>
             </div>
             <ul id="online-user-list" class="user-list"></ul>
           </section>
 
-          <section id="score-panel" class="panel score-panel hidden">
-            <div class="sidebar-title">
+          <section id="score-panel" class="panel sidebar-panel hidden">
+            <div class="sidebar-heading">
               <h2>대결 점수</h2>
-              <span id="difficulty-pill" class="count-pill"></span>
             </div>
             <ol id="score-list" class="score-list"></ol>
           </section>
@@ -177,9 +254,11 @@
     </section>
   </main>
 
-  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">
-    <div class="modal panel">
-      <button id="modal-close-button" class="modal-close" type="button" aria-label="닫기">×</button>
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <button id="modal-close-button" class="modal-close-button" type="button" aria-label="닫기">
+        ×
+      </button>
       <div id="modal-content"></div>
     </div>
   </div>

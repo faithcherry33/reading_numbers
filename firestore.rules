@@ -2,18 +2,35 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    // 이 게임은 Firebase 익명 로그인을 사용합니다.
-    // 교실용 프로토타입 규칙으로, 로그인한 사용자가 실시간 대결 문서를 갱신할 수 있습니다.
-    // 상금·공식 기록처럼 조작 방지가 중요한 서비스라면 점수 처리를 Cloud Functions로 옮기세요.
-
-    match /numberReadingRooms/{roomId}/presence/{userId} {
-      allow read: if request.auth != null;
-      allow create, update, delete: if request.auth != null
-        && request.auth.uid == userId;
+    function signedIn() {
+      return request.auth != null;
     }
 
-    match /numberReadingMatches/{roomId} {
-      allow read, create, update, delete: if request.auth != null;
+    match /numberReadingRooms/{roomId}/presence/{uid} {
+      allow read: if signedIn();
+
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid;
+
+      allow delete: if signedIn() && (
+        request.auth.uid == uid
+        || resource.data.lastSeen < request.time - duration.value(2, 'm')
+      );
+    }
+
+    match /numberReadingMatches/{channelId} {
+      allow read: if signedIn();
+
+      allow create: if signedIn()
+        && request.resource.data.hostUid == request.auth.uid;
+
+      /*
+       * 같은 방의 참가자들이 점수·참여·퇴장 상태를 트랜잭션으로
+       * 함께 갱신하는 구조이므로 로그인된 사용자에게 갱신을 허용합니다.
+       * 익명 로그인 없이 접근하는 사용자는 읽기와 쓰기 모두 불가능합니다.
+       */
+      allow update, delete: if signedIn();
     }
   }
 }

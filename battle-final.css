@@ -1,0 +1,130 @@
+/* 최종 대결 기능 추가 스타일: 기존 style.css 뒤에 불러옵니다. */
+
+.battle-lobby-summary {
+  margin: 22px 0;
+  padding: 18px;
+  border: 1px solid #dfe3f2;
+  border-radius: 16px;
+  background: #f7f8fd;
+  color: #566077;
+  font-weight: 700;
+  line-height: 1.7;
+}
+
+.lobby-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.solo-battle-invite {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid #f0cc67;
+  border-radius: 15px;
+  background: #fff8da;
+}
+
+.solo-battle-invite strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.solo-battle-invite p {
+  margin: 0;
+  color: #6f6240;
+  line-height: 1.5;
+}
+
+.battle-game-header,
+.battle-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.compact-button {
+  min-height: 38px;
+  padding: 8px 13px;
+  font-size: 0.9rem;
+}
+
+.danger-button {
+  border: 1px solid #e49b9b;
+  border-radius: 12px;
+  background: #fff2f2;
+  color: #a12929;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.danger-button:hover {
+  background: #ffe5e5;
+}
+
+.danger-outline {
+  border-color: #e5a0a0 !important;
+  color: #a12929 !important;
+}
+
+.modal-action-stack {
+  display: grid;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.user-list .mode-tag.accepted {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #dcf7e9;
+  color: #0f6f43;
+}
+
+.user-list .mode-tag.not-accepted {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #fff0c9;
+  color: #815000;
+}
+
+.score-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.score-name small {
+  color: #8a5d5d;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.hidden {
+  display: none !important;
+}
+
+@media (max-width: 640px) {
+  .lobby-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .solo-battle-invite,
+  .battle-game-header,
+  .battle-header-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .battle-header-actions {
+    width: 100%;
+  }
+
+  .battle-header-actions .danger-button {
+    width: 100%;
+  }
+}
