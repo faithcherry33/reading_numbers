@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>한글 수 읽기 대결 데이터 초기화</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f6ff;
+      color: #17213f;
+    }
+    main {
+      width: min(100%, 640px);
+      padding: 32px;
+      border: 1px solid #dfe3f2;
+      border-radius: 22px;
+      background: white;
+      box-shadow: 0 18px 50px rgba(23, 33, 63, 0.12);
+    }
+    h1 { margin-top: 0; }
+    .warning {
+      padding: 16px;
+      border: 1px solid #efb5b5;
+      border-radius: 14px;
+      background: #fff3f3;
+      color: #8d2424;
+      line-height: 1.6;
+    }
+    button {
+      width: 100%;
+      min-height: 48px;
+      margin-top: 20px;
+      border: 0;
+      border-radius: 14px;
+      background: #4d46ef;
+      color: white;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    #result { margin-top: 18px; line-height: 1.7; white-space: pre-line; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>대결 유령 데이터 초기화</h1>
+    <p class="warning">
+      다른 학생이 대결 중일 때 실행하면 그 대결도 삭제됩니다.
+      모든 학생이 앱을 닫은 상태에서 한 번만 실행한 뒤,
+      성공을 확인하면 저장소에서 이 파일을 삭제하세요.
+    </p>
+    <button id="reset-button" type="button">모든 방의 대결 데이터 초기화</button>
+    <p id="result">Firebase 연결을 준비하고 있습니다.</p>
+  </main>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js";
+    import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
+    import {
+      collection,
+      deleteDoc,
+      doc,
+      getDocs,
+      getFirestore
+    } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
+    import { firebaseConfig, isFirebaseConfigured } from "./firebase-config.js";
+
+    const channelIds = ["stage1", "stage2", "stage3", "stage4", "free"];
+    const resetButton = document.querySelector("#reset-button");
+    const result = document.querySelector("#result");
+
+    let db = null;
+
+    async function initialize() {
+      if (!isFirebaseConfigured) {
+        result.textContent = "firebase-config.js 설정을 확인하세요.";
+        resetButton.disabled = true;
+        return;
+      }
+
+      const app = initializeApp(firebaseConfig);
+      const auth = getAuth(app);
+      db = getFirestore(app);
+      await signInAnonymously(auth);
+      result.textContent = "준비되었습니다. 모든 학생이 앱을 닫았는지 확인한 뒤 버튼을 누르세요.";
+    }
+
+    async function resetGhostData() {
+      if (!db) return;
+      if (!window.confirm("현재 저장된 모든 방의 대결을 삭제할까요?")) return;
+
+      resetButton.disabled = true;
+      result.textContent = "초기화 중입니다.";
+
+      let deletedMatches = 0;
+      let deletedPresence = 0;
+      let skippedPresence = 0;
+
+      for (const channelId of channelIds) {
+        try {
+          await deleteDoc(doc(db, "numberReadingMatches", channelId));
+          deletedMatches += 1;
+        } catch (error) {
+          console.warn(`${channelId} 대결 삭제 실패`, error);
+        }
+
+        try {
+          const snapshot = await getDocs(
+            collection(db, "numberReadingRooms", channelId, "presence")
+          );
+
+          const outcomes = await Promise.allSettled(
+            snapshot.docs.map((item) => deleteDoc(item.ref))
+          );
+
+          outcomes.forEach((outcome) => {
+            if (outcome.status === "fulfilled") deletedPresence += 1;
+            else skippedPresence += 1;
+          });
+        } catch (error) {
+          console.warn(`${channelId} 접속 정보 확인 실패`, error);
+        }
+      }
+
+      result.textContent =
+        `초기화 완료\n` +
+        `대결 문서 삭제 시도: ${deletedMatches}개 방\n` +
+        `접속 문서 삭제 성공: ${deletedPresence}개\n` +
+        `규칙상 삭제되지 않은 접속 문서: ${skippedPresence}개\n\n` +
+        `이제 앱을 새로고침해 확인한 뒤 reset-ghosts.html을 저장소에서 삭제하세요.`;
+    }
+
+    resetButton.addEventListener("click", () => {
+      resetGhostData().catch((error) => {
+        console.error(error);
+        result.textContent = `초기화 실패: ${error.message}`;
+        resetButton.disabled = false;
+      });
+    });
+
+    initialize().catch((error) => {
+      console.error(error);
+      result.textContent = `Firebase 연결 실패: ${error.message}`;
+      resetButton.disabled = true;
+    });
+  </script>
+</body>
+</html>

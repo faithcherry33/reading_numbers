@@ -40,8 +40,10 @@ const MIN_BATTLE_PLAYERS = 4;
 const PRESENCE_VISIBLE_MS = 65 * 1000;
 const STALE_PRESENCE_MS = 2 * 60 * 1000;
 const MATCH_INACTIVITY_LIMIT_MS = 3 * 60 * 1000;
+const DISCONNECTED_PLAYER_GRACE_MS = 3 * 60 * 1000;
 const MATCH_CLEANUP_INTERVAL_MS = 15 * 1000;
 const RECENT_EVENT_WINDOW_MS = 90 * 1000;
+const FINISHED_MATCH_RETENTION_MS = 10 * 60 * 1000;
 
 const state = {
   nickname: "",
@@ -725,17 +727,103 @@ function getIntentionalExitMessage() {
 }
 
 async function recordIntentionalExitFromCurrentSession() {
-  const match = state.match;
-  const channel = state.channel;
+  if (
+    !state.firebaseReady ||
+    !state.channel ||
+    !state.uid
+  ) {
+    return { sessionChanged: false };
+  }
 
-  if (!state.firebaseReady || !match || !channel) return;
+  const matchRef = doc(
+    state.db,
+    FIREBASE_COLLECTIONS.matches,
+    state.channel.id
+  );
 
-  const session = {
-    channelId: channel.id,
-    match
-  };
+  return runTransaction(state.db, async (transaction) => {
+    const snapshot = await transaction.get(matchRef);
+    if (!snapshot.exists()) {
+      return { sessionChanged: false };
+    }
 
-  await abandonSession(session, "left-intentionally");
+    const fresh = snapshot.data();
+
+    if (fresh.status === "waiting") {
+      if (fresh.hostUid === state.uid) {
+        transaction.delete(matchRef);
+        return { sessionChanged: true, action: "proposal-cancelled" };
+      }
+
+      if (fresh.acceptedPlayers?.[state.uid]) {
+        const acceptedPlayers = { ...(fresh.acceptedPlayers || {}) };
+        delete acceptedPlayers[state.uid];
+        transaction.update(matchRef, { acceptedPlayers });
+        return { sessionChanged: true, action: "acceptance-cancelled" };
+      }
+
+      return { sessionChanged: false };
+    }
+
+    if (
+      fresh.status !== "playing" ||
+      !fresh.participantIds?.includes(state.uid) ||
+      fresh.eliminated?.[state.uid]
+    ) {
+      return { sessionChanged: false };
+    }
+
+    const now = Date.now();
+    const nextEliminated = {
+      ...(fresh.eliminated || {}),
+      [state.uid]: true
+    };
+
+    const updates = {
+      [`eliminated.${state.uid}`]: true,
+      [`eliminatedAtMs.${state.uid}`]: now,
+      [`exitReasons.${state.uid}`]: "left-intentionally"
+    };
+
+    const remainingActiveCount = fresh.participantIds.filter(
+      (uid) => !nextEliminated[uid]
+    ).length;
+
+    if (remainingActiveCount === 0) {
+      updates.status = "finished";
+      updates.finishedAt = serverTimestamp();
+      updates.finishedAtMs = now;
+      updates.finishedReason = "all-players-left";
+    }
+
+    transaction.update(matchRef, updates);
+    return { sessionChanged: true, action: "player-eliminated" };
+  });
+}
+
+function restartRoomRealtimeAfterExitFailure() {
+  if (!state.firebaseReady || !state.channel) return;
+
+  subscribeToPresence();
+  subscribeToMatch();
+  startHeartbeat();
+  startMatchCleanup();
+}
+
+function showExitFailureModal() {
+  openModal(`
+    <p class="eyebrow">EXIT FAILED</p>
+    <h2>퇴장 처리를 완료하지 못했습니다.</h2>
+    <p class="subtext">
+      네트워크 연결 또는 Firestore 규칙 때문에 대결 기록을 갱신하지 못했습니다.
+      기록이 남지 않은 채 방을 나가면 유령 참가자가 생길 수 있어 현재 방에 그대로 머뭅니다.
+    </p>
+    <button id="exit-failure-confirm" class="primary-button" type="button">
+      확인
+    </button>
+  `);
+
+  $("#exit-failure-confirm").addEventListener("click", closeModal);
 }
 
 async function requestIntentionalRoomExit({ navigateHistory = true } = {}) {
@@ -753,6 +841,10 @@ async function requestIntentionalRoomExit({ navigateHistory = true } = {}) {
     await recordIntentionalExitFromCurrentSession();
   } catch (error) {
     console.error("대결 퇴장 기록 실패", error);
+    state.exitInProgress = false;
+    restartRoomRealtimeAfterExitFailure();
+    showExitFailureModal();
+    return false;
   }
 
   await clearRoomState();
@@ -918,6 +1010,28 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
   );
   const now = Date.now();
 
+  let presenceLastSeenByUid = {};
+
+  try {
+    const presenceSnapshot = await getDocs(
+      collection(
+        state.db,
+        FIREBASE_COLLECTIONS.rooms,
+        channelId,
+        "presence"
+      )
+    );
+
+    presenceLastSeenByUid = Object.fromEntries(
+      presenceSnapshot.docs.map((item) => {
+        const data = item.data();
+        return [data.uid || item.id, Number(data.lastSeenMs || 0)];
+      })
+    );
+  } catch (error) {
+    console.warn("접속 상태를 이용한 유령 대결 확인 실패", error);
+  }
+
   try {
     await runTransaction(state.db, async (transaction) => {
       const snapshot = await transaction.get(matchRef);
@@ -925,11 +1039,23 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
 
       const match = snapshot.data();
 
+      if (match.status === "finished") {
+        const finishedAtMs = Number(match.finishedAtMs || 0);
+        if (
+          finishedAtMs &&
+          now - finishedAtMs >= FINISHED_MATCH_RETENTION_MS
+        ) {
+          transaction.delete(matchRef);
+        }
+        return;
+      }
+
       if (match.status === "waiting") {
-        const proposalTime =
+        const proposalTime = Number(
           match.proposalUpdatedAtMs ||
           match.createdAtMs ||
-          0;
+          0
+        );
 
         if (
           proposalTime &&
@@ -940,7 +1066,10 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
         return;
       }
 
-      if (match.status !== "playing") return;
+      if (match.status !== "playing") {
+        transaction.delete(matchRef);
+        return;
+      }
 
       const participantIds = match.participantIds || [];
       if (participantIds.length === 0) {
@@ -950,35 +1079,32 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
 
       const eliminated = match.eliminated || {};
       const lastActivityAtMs = match.lastActivityAtMs || {};
-
-      const isLegacyMatch = Object.keys(lastActivityAtMs).length === 0;
-      if (isLegacyMatch) {
-        const legacyLastTime =
-          match.questionStartedAtMs ||
-          match.startsAtMs ||
-          match.createdAtMs ||
-          0;
-
-        if (
-          legacyLastTime &&
-          now - legacyLastTime >= MATCH_INACTIVITY_LIMIT_MS
-        ) {
-          transaction.delete(matchRef);
-        }
-        return;
-      }
+      const fallbackStartTime = Number(
+        match.startedAtMs ||
+        match.startsAtMs ||
+        match.questionStartedAtMs ||
+        match.createdAtMs ||
+        0
+      );
 
       const inactiveIds = participantIds.filter((uid) => {
         if (eliminated[uid]) return false;
 
-        const lastActivity =
-          lastActivityAtMs[uid] ||
-          match.startedAtMs ||
-          match.startsAtMs ||
-          match.createdAtMs ||
-          now;
+        const activityTime = Number(
+          lastActivityAtMs[uid] || fallbackStartTime || 0
+        );
+        const presenceTime = Number(presenceLastSeenByUid[uid] || 0);
 
-        return now - lastActivity >= MATCH_INACTIVITY_LIMIT_MS;
+        const answerInactive =
+          activityTime > 0 &&
+          now - activityTime >= MATCH_INACTIVITY_LIMIT_MS;
+
+        const disconnectedLongEnough = presenceTime > 0
+          ? now - presenceTime >= DISCONNECTED_PLAYER_GRACE_MS
+          : fallbackStartTime > 0 &&
+            now - fallbackStartTime >= DISCONNECTED_PLAYER_GRACE_MS;
+
+        return answerInactive || disconnectedLongEnough;
       });
 
       if (!inactiveIds.length) return;
