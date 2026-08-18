@@ -57,6 +57,7 @@ const RECENT_EVENT_WINDOW_MS = 90 * 1000;
 const FINISHED_MATCH_RETENTION_MS = 3 * 60 * 1000;
 const MATCH_MAX_LIFETIME_MS = 25 * 60 * 1000;
 const SESSION_RESUME_WINDOW_MS = 90 * 1000;
+const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000;
 
 const state = {
   nickname: "",
@@ -86,6 +87,7 @@ const state = {
   exitInProgress: false,
   sessionPromptOpen: false,
   serverOffsetMs: 0,
+  offsetSynced: false,
   presenceCache: [],
   presenceReady: false
 };
@@ -119,6 +121,25 @@ function syncServerOffset(timestampValue) {
  * 곱해집니다. 접속자 중 uid가 가장 앞선 한 명만 정리를 수행하고,
  * 그 학생이 사라지면 자동으로 다음 사람이 이어받습니다.
  */
+/*
+ * 기록이 만료되었는지 판단합니다.
+ *
+ * 시계가 앞서 있는 기기가 남긴 기록은 '미래 시각'으로 저장되어 있어,
+ * 단순히 (지금 - 기록시각 >= 한계)로만 보면 그 시차만큼 지나갈 때까지
+ * 절대 만료되지 않습니다. 수정 이전 버전이 만들어 둔 기존 유령들이
+ * 바로 이 상태입니다. 허용 오차를 넘는 미래 값은 잘못된 기록으로 보고
+ * 곧바로 만료 처리합니다.
+ */
+function isExpired(timestampMs, limitMs, now = serverNow()) {
+  const value = Number(timestampMs || 0);
+  if (!value) return true;
+
+  const age = now - value;
+  if (age < -CLOCK_SKEW_TOLERANCE_MS) return true;
+
+  return age >= limitMs;
+}
+
 function isDesignatedCleaner() {
   const uids = state.onlineUsers
     .filter((user) => !user.away)
@@ -436,8 +457,7 @@ function getSessionActivityTime(session) {
 }
 
 function isStaleSession(session) {
-  const activityTime = getSessionActivityTime(session);
-  return !activityTime || serverNow() - activityTime >= SESSION_RESUME_WINDOW_MS;
+  return isExpired(getSessionActivityTime(session), SESSION_RESUME_WINDOW_MS);
 }
 
 /*
@@ -765,12 +785,12 @@ async function clearRoomState({ closeCurrentModal = true } = {}) {
      * 마지막이라면 방 데이터를 통째로 비워, 아무도 없는 방에 유령
      * 대결이 남아 다음 사람을 막는 상황을 없앱니다.
      */
-    const cutoff = serverNow() - STALE_PRESENCE_MS;
+    const leaveNow = serverNow();
     const wasLastPerson = !state.presenceCache.some(
       (entry) =>
         entry.uid !== state.uid &&
         !entry.away &&
-        (entry.lastSeenMs || 0) >= cutoff
+        !isExpired(entry.lastSeenMs, STALE_PRESENCE_MS, leaveNow)
     );
 
     try {
@@ -1119,10 +1139,12 @@ async function cleanupStalePresence() {
   if (!state.firebaseReady || !state.channel) return;
 
   // onSnapshot 캐시를 그대로 씁니다. 추가 읽기가 발생하지 않습니다.
-  const cutoff = serverNow() - STALE_PRESENCE_MS;
+  const now = serverNow();
   const channelId = state.channel.id;
   const stale = state.presenceCache.filter(
-    (entry) => entry.uid !== state.uid && (entry.lastSeenMs || 0) < cutoff
+    (entry) =>
+      entry.uid !== state.uid &&
+      isExpired(entry.lastSeenMs, STALE_PRESENCE_MS, now)
   );
 
   if (!stale.length) return;
@@ -1166,11 +1188,11 @@ async function cleanupStaleMatch(
 
     const presence = presenceByUid[uid];
     if (!presence) return true;
-    if (presence.away && now - (presence.awayAtMs || 0) >= AWAY_GRACE_MS) {
+    if (presence.away && isExpired(presence.awayAtMs, AWAY_GRACE_MS, now)) {
       return true;
     }
 
-    return now - (presence.lastSeenMs || 0) >= STALE_PRESENCE_MS;
+    return isExpired(presence.lastSeenMs, STALE_PRESENCE_MS, now);
   };
 
   try {
@@ -1185,24 +1207,22 @@ async function cleanupStaleMatch(
        * 어떤 경로로 상태가 꼬이더라도 25분이 지난 문서는 무조건 삭제합니다.
        * 20문제 대결은 아무리 늘어져도 이보다 짧습니다.
        */
-      const createdAtMs = Number(match.createdAtMs || 0);
-      if (createdAtMs && now - createdAtMs >= MATCH_MAX_LIFETIME_MS) {
+      if (isExpired(match.createdAtMs, MATCH_MAX_LIFETIME_MS, now)) {
         transaction.delete(matchRef);
         return;
       }
 
       if (match.status === "finished") {
-        const finishedAtMs = Number(match.finishedAtMs || 0);
-        if (!finishedAtMs || now - finishedAtMs >= FINISHED_MATCH_RETENTION_MS) {
+        if (isExpired(match.finishedAtMs, FINISHED_MATCH_RETENTION_MS, now)) {
           transaction.delete(matchRef);
         }
         return;
       }
 
       if (match.status === "waiting") {
-        const proposalTime = Number(
-          match.proposalUpdatedAtMs || match.createdAtMs || 0
-        );
+        const proposalTime =
+          Number(match.proposalUpdatedAtMs || 0) ||
+          Number(match.createdAtMs || 0);
 
         // 제안자가 사라졌으면 제안 자체를 정리합니다.
         if (isLobbyGhost(match.hostUid)) {
@@ -1210,7 +1230,7 @@ async function cleanupStaleMatch(
           return;
         }
 
-        if (proposalTime && now - proposalTime >= MATCH_INACTIVITY_LIMIT_MS) {
+        if (isExpired(proposalTime, MATCH_INACTIVITY_LIMIT_MS, now)) {
           transaction.delete(matchRef);
           return;
         }
@@ -1258,7 +1278,10 @@ async function cleanupStaleMatch(
           lastActivityAtMs[uid] || fallbackStartTime || 0
         );
 
-        if (activityTime > 0 && now - activityTime >= MATCH_INACTIVITY_LIMIT_MS) {
+        if (
+          activityTime > 0 &&
+          isExpired(activityTime, MATCH_INACTIVITY_LIMIT_MS, now)
+        ) {
           exitReasonByUid[uid] = "inactive";
           return;
         }
@@ -1276,9 +1299,9 @@ async function cleanupStaleMatch(
          */
         const presence = presenceByUid[uid];
         const disconnected = presence
-          ? now - (presence.lastSeenMs || 0) >= DISCONNECTED_PLAYER_GRACE_MS
+          ? isExpired(presence.lastSeenMs, DISCONNECTED_PLAYER_GRACE_MS, now)
           : activityTime > 0 &&
-            now - activityTime >= DISCONNECTED_PLAYER_GRACE_MS;
+            isExpired(activityTime, DISCONNECTED_PLAYER_GRACE_MS, now);
 
         if (disconnected) exitReasonByUid[uid] = "disconnected";
       });
@@ -1381,6 +1404,18 @@ function subscribeToPresence() {
       const mine = snapshot.docs.find((item) => item.id === state.uid);
       if (mine && !mine.metadata.hasPendingWrites) {
         syncServerOffset(mine.data().lastSeen);
+
+        /*
+         * 방에 들어온 직후의 첫 기록은 아직 보정 전 시계로 쓰였습니다.
+         * 시차가 크면 내 기록이 '미래 시각'으로 남아 다른 학생 화면에서
+         * 사라져 버리므로, 보정값을 얻는 즉시 한 번 다시 씁니다.
+         */
+        if (!state.offsetSynced) {
+          state.offsetSynced = true;
+          if (Math.abs(state.serverOffsetMs) > 5000) {
+            heartbeatOnce().catch(console.warn);
+          }
+        }
       }
 
       /*
@@ -1401,9 +1436,11 @@ function subscribeToPresence() {
 
       state.presenceReady = true;
 
-      const cutoff = serverNow() - PRESENCE_VISIBLE_MS;
+      const visibleNow = serverNow();
       state.onlineUsers = state.presenceCache
-        .filter((user) => (user.lastSeenMs || 0) >= cutoff)
+        .filter(
+          (user) => !isExpired(user.lastSeenMs, PRESENCE_VISIBLE_MS, visibleNow)
+        )
         .sort((first, second) =>
           String(first.nickname || "").localeCompare(
             String(second.nickname || ""),
