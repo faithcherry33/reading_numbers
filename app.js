@@ -37,13 +37,26 @@ const STORAGE_KEYS = {
 };
 
 const MIN_BATTLE_PLAYERS = 4;
-const PRESENCE_VISIBLE_MS = 65 * 1000;
-const STALE_PRESENCE_MS = 2 * 60 * 1000;
+
+/*
+ * 타이밍 상수
+ *
+ * 하트비트 간격을 무작정 줄이면 Firestore 읽기/쓰기 할당량이 폭증합니다.
+ * (쓰기 1회가 그 방에 접속한 모든 학생에게 읽기 1회씩으로 퍼져 나갑니다.)
+ * 그래서 평상시 이탈은 away 플래그로 즉시 잡고, 하트비트는 앱이 강제
+ * 종료되거나 네트워크가 끊긴 경우에만 쓰이는 예비 수단으로 둡니다.
+ */
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const PRESENCE_VISIBLE_MS = 75 * 1000;
+const STALE_PRESENCE_MS = 100 * 1000;
+const DISCONNECTED_PLAYER_GRACE_MS = 100 * 1000;
+const AWAY_GRACE_MS = 20 * 1000;
 const MATCH_INACTIVITY_LIMIT_MS = 3 * 60 * 1000;
-const DISCONNECTED_PLAYER_GRACE_MS = 3 * 60 * 1000;
 const MATCH_CLEANUP_INTERVAL_MS = 15 * 1000;
 const RECENT_EVENT_WINDOW_MS = 90 * 1000;
-const FINISHED_MATCH_RETENTION_MS = 10 * 60 * 1000;
+const FINISHED_MATCH_RETENTION_MS = 3 * 60 * 1000;
+const MATCH_MAX_LIFETIME_MS = 25 * 60 * 1000;
+const SESSION_RESUME_WINDOW_MS = 90 * 1000;
 
 const state = {
   nickname: "",
@@ -71,10 +84,58 @@ const state = {
   ),
   suppressNextPopstate: false,
   exitInProgress: false,
-  sessionPromptOpen: false
+  sessionPromptOpen: false,
+  serverOffsetMs: 0,
+  presenceCache: [],
+  presenceReady: false
 };
 
 const $ = (selector) => document.querySelector(selector);
+
+/*
+ * 서버 시각 기준 현재 시각.
+ *
+ * 학생 기기(태블릿·크롬북)의 시계는 몇 분씩 틀어져 있는 경우가 흔합니다.
+ * 유령 판정을 각자의 로컬 시계로 하면, 시계가 빨리 가는 기기가 남긴
+ * 기록은 다른 학생 눈에 영원히 "방금 접속"으로 보여 절대 지워지지 않습니다.
+ * 방 전체가 같은 기준을 쓰도록 서버 시각과의 차이를 계속 보정합니다.
+ */
+const serverNow = () => Date.now() + state.serverOffsetMs;
+
+function syncServerOffset(timestampValue) {
+  const ms = timestampValue?.toMillis?.();
+  if (!ms) return;
+
+  const offset = ms - Date.now();
+  state.serverOffsetMs = state.serverOffsetMs
+    ? Math.round(state.serverOffsetMs * 0.7 + offset * 0.3)
+    : offset;
+}
+
+/*
+ * 청소 담당자 선출.
+ *
+ * 모든 학생이 동시에 정리 트랜잭션을 돌리면 읽기/쓰기가 인원수만큼
+ * 곱해집니다. 접속자 중 uid가 가장 앞선 한 명만 정리를 수행하고,
+ * 그 학생이 사라지면 자동으로 다음 사람이 이어받습니다.
+ */
+function isDesignatedCleaner() {
+  const uids = state.onlineUsers
+    .filter((user) => !user.away)
+    .map((user) => user.uid)
+    .filter(Boolean)
+    .sort();
+
+  return uids.length === 0 || uids[0] === state.uid;
+}
+
+function buildPresenceIndex() {
+  return Object.fromEntries(
+    state.presenceCache
+      .filter((entry) => entry.uid)
+      .map((entry) => [entry.uid, entry])
+  );
+}
 
 const elements = {
   nicknameScreen: $("#nickname-screen"),
@@ -359,9 +420,46 @@ async function getNormalizedActiveSessions() {
   return [primarySession];
 }
 
+function getSessionActivityTime(session) {
+  const match = session.match;
+
+  if (match.status === "playing") {
+    return Number(
+      match.lastActivityAtMs?.[state.uid] ||
+      match.startedAtMs ||
+      match.createdAtMs ||
+      0
+    );
+  }
+
+  return Number(match.proposalUpdatedAtMs || match.createdAtMs || 0);
+}
+
+function isStaleSession(session) {
+  const activityTime = getSessionActivityTime(session);
+  return !activityTime || serverNow() - activityTime >= SESSION_RESUME_WINDOW_MS;
+}
+
+/*
+ * 오래된 세션은 묻지 않고 정리합니다.
+ *
+ * 기존에는 뒤로 가기로 남은 기록 하나 때문에 학생이 "이전 대결 발견"
+ * 모달에 계속 붙잡혀 다른 방에도 들어가지 못했습니다. 이어하기를
+ * 제안할 가치가 있는 것은 방금 끊긴 세션뿐입니다.
+ */
 async function findBlockingSession({ allowedRoundId = null } = {}) {
   const sessions = await getNormalizedActiveSessions();
-  return sessions.find(({ match }) => match.roundId !== allowedRoundId) || null;
+  const session = sessions.find(({ match }) => match.roundId !== allowedRoundId);
+  if (!session) return null;
+
+  if (isStaleSession(session)) {
+    await abandonSession(session, "stale-session-auto-cleanup").catch(
+      console.warn
+    );
+    return null;
+  }
+
+  return session;
 }
 
 async function abandonSession(session, reason = "abandoned-previous-match") {
@@ -400,7 +498,7 @@ async function abandonSession(session, reason = "abandoned-previous-match") {
       return;
     }
 
-    const now = Date.now();
+    const now = serverNow();
     const nextEliminated = {
       ...(fresh.eliminated || {}),
       [state.uid]: true
@@ -491,6 +589,14 @@ async function resumePreviousSessionIfAvailable() {
   if (!sessions.length) return false;
 
   const session = sessions[0];
+
+  if (isStaleSession(session)) {
+    await abandonSession(session, "stale-session-auto-cleanup").catch(
+      console.warn
+    );
+    return false;
+  }
+
   const oldNickname = getSessionNickname(session);
 
   if (!state.nickname || state.nickname === oldNickname) {
@@ -610,7 +716,7 @@ async function enterRoom(
 
   if (!state.firebaseReady) {
     state.onlineUsers = [
-      { uid: "local", nickname: state.nickname, mode: "idle", lastSeenMs: Date.now() }
+      { uid: "local", nickname: state.nickname, mode: "idle", lastSeenMs: serverNow() }
     ];
     renderOnlineUsers();
     return;
@@ -654,6 +760,19 @@ async function clearRoomState({ closeCurrentModal = true } = {}) {
   stopRoomListeners();
 
   if (state.firebaseReady && oldChannel && state.uid) {
+    /*
+     * 내가 마지막 한 명이었는지 캐시로 판단합니다. (추가 읽기 없음)
+     * 마지막이라면 방 데이터를 통째로 비워, 아무도 없는 방에 유령
+     * 대결이 남아 다음 사람을 막는 상황을 없앱니다.
+     */
+    const cutoff = serverNow() - STALE_PRESENCE_MS;
+    const wasLastPerson = !state.presenceCache.some(
+      (entry) =>
+        entry.uid !== state.uid &&
+        !entry.away &&
+        (entry.lastSeenMs || 0) >= cutoff
+    );
+
     try {
       await deleteDoc(
         doc(
@@ -664,10 +783,19 @@ async function clearRoomState({ closeCurrentModal = true } = {}) {
           state.uid
         )
       );
+
+      if (wasLastPerson) {
+        await deleteDoc(
+          doc(state.db, FIREBASE_COLLECTIONS.matches, oldChannel.id)
+        ).catch(() => {});
+      }
     } catch (error) {
       console.warn("접속자 정보 삭제 실패", error);
     }
   }
+
+  state.presenceCache = [];
+  state.presenceReady = false;
 
   state.channel = null;
   state.mode = "idle";
@@ -773,7 +901,7 @@ async function recordIntentionalExitFromCurrentSession() {
       return { sessionChanged: false };
     }
 
-    const now = Date.now();
+    const now = serverNow();
     const nextEliminated = {
       ...(fresh.eliminated || {}),
       [state.uid]: true
@@ -801,35 +929,13 @@ async function recordIntentionalExitFromCurrentSession() {
   });
 }
 
-function restartRoomRealtimeAfterExitFailure() {
-  if (!state.firebaseReady || !state.channel) return;
-
-  subscribeToPresence();
-  subscribeToMatch();
-  startHeartbeat();
-  startMatchCleanup();
-}
-
-function showExitFailureModal() {
-  openModal(`
-    <p class="eyebrow">EXIT FAILED</p>
-    <h2>퇴장 처리를 완료하지 못했습니다.</h2>
-    <p class="subtext">
-      네트워크 연결 또는 Firestore 규칙 때문에 대결 기록을 갱신하지 못했습니다.
-      기록이 남지 않은 채 방을 나가면 유령 참가자가 생길 수 있어 현재 방에 그대로 머뭅니다.
-    </p>
-    <button id="exit-failure-confirm" class="primary-button" type="button">
-      확인
-    </button>
-  `);
-
-  $("#exit-failure-confirm").addEventListener("click", closeModal);
-}
-
-async function requestIntentionalRoomExit({ navigateHistory = true } = {}) {
+async function requestIntentionalRoomExit({
+  navigateHistory = true,
+  confirmFirst = true
+} = {}) {
   if (!state.channel || state.exitInProgress) return false;
 
-  const needsConfirmation = currentRoomExitNeedsConfirmation();
+  const needsConfirmation = confirmFirst && currentRoomExitNeedsConfirmation();
   if (needsConfirmation && !window.confirm(getIntentionalExitMessage())) {
     return false;
   }
@@ -840,13 +946,15 @@ async function requestIntentionalRoomExit({ navigateHistory = true } = {}) {
   try {
     await recordIntentionalExitFromCurrentSession();
   } catch (error) {
-    console.error("대결 퇴장 기록 실패", error);
-    state.exitInProgress = false;
-    restartRoomRealtimeAfterExitFailure();
-    showExitFailureModal();
-    return false;
+    /*
+     * 기록에 실패해도 학생을 방에 붙잡아 두지 않습니다.
+     * 남아 있는 학생들의 정리 루프가 100초 안에 처리하고,
+     * 그마저 안 되면 절대 수명이 방을 초기화합니다.
+     */
+    console.warn("퇴장 기록 실패 — 자동 정리에 맡기고 나갑니다", error);
   }
 
+  markPresenceAway(true);
   await clearRoomState();
   state.exitInProgress = false;
 
@@ -867,13 +975,15 @@ async function createOrUpdatePresence(
     uid: state.uid,
     nickname: state.nickname,
     mode,
+    away: false,
+    awayAtMs: 0,
     lastSeen: serverTimestamp(),
-    lastSeenMs: Date.now()
+    lastSeenMs: serverNow()
   };
 
   if (!preserveJoinedAt) {
     data.joinedAt = serverTimestamp();
-    data.joinedAtMs = Date.now();
+    data.joinedAtMs = serverNow();
   }
 
   await setDoc(
@@ -894,7 +1004,7 @@ async function setPresenceMode(mode) {
 
   if (!state.firebaseReady || !state.channel) {
     state.onlineUsers = [
-      { uid: "local", nickname: state.nickname, mode, lastSeenMs: Date.now() }
+      { uid: "local", nickname: state.nickname, mode, lastSeenMs: serverNow() }
     ];
     renderOnlineUsers();
     renderRoom();
@@ -914,7 +1024,7 @@ async function setPresenceMode(mode) {
         mode,
         nickname: state.nickname,
         lastSeen: serverTimestamp(),
-        lastSeenMs: Date.now()
+        lastSeenMs: serverNow()
       }
     );
   } catch (error) {
@@ -923,6 +1033,33 @@ async function setPresenceMode(mode) {
   }
 
   renderRoom();
+}
+
+/*
+ * 화면을 벗어났음을 즉시 기록합니다.
+ *
+ * 뒤로 가기, 앱 전환, 탭 닫기, 화면 잠금에서 visibilitychange와 pagehide는
+ * 대부분 발생합니다. 이 쓰기가 완료되면 다른 학생들의 참여 목록에서 곧바로
+ * 빠지고, 완료되지 못하더라도 하트비트 만료가 예비 수단으로 잡아냅니다.
+ */
+function markPresenceAway(isAway) {
+  if (!state.firebaseReady || !state.channel || !state.uid) return;
+
+  updateDoc(
+    doc(
+      state.db,
+      FIREBASE_COLLECTIONS.rooms,
+      state.channel.id,
+      "presence",
+      state.uid
+    ),
+    {
+      away: isAway,
+      awayAtMs: isAway ? serverNow() : 0,
+      lastSeen: serverTimestamp(),
+      lastSeenMs: serverNow()
+    }
+  ).catch(() => {});
 }
 
 async function heartbeatOnce() {
@@ -940,8 +1077,10 @@ async function heartbeatOnce() {
       {
         nickname: state.nickname,
         mode: state.mode,
+        away: false,
+        awayAtMs: 0,
         lastSeen: serverTimestamp(),
-        lastSeenMs: Date.now()
+        lastSeenMs: serverNow()
       }
     );
   } catch (error) {
@@ -960,7 +1099,7 @@ async function heartbeatOnce() {
           FIREBASE_COLLECTIONS.matches,
           state.channel.id
         ),
-        { proposalUpdatedAtMs: Date.now() }
+        { proposalUpdatedAtMs: serverNow() }
       );
     } catch (error) {
       console.warn("대결 제안 유지 시각 갱신 실패", error);
@@ -973,64 +1112,66 @@ function startHeartbeat() {
 
   state.heartbeatId = window.setInterval(() => {
     heartbeatOnce().catch(console.warn);
-  }, 20 * 1000);
+  }, HEARTBEAT_INTERVAL_MS);
 }
 
 async function cleanupStalePresence() {
   if (!state.firebaseReady || !state.channel) return;
 
+  // onSnapshot 캐시를 그대로 씁니다. 추가 읽기가 발생하지 않습니다.
+  const cutoff = serverNow() - STALE_PRESENCE_MS;
+  const channelId = state.channel.id;
+  const stale = state.presenceCache.filter(
+    (entry) => entry.uid !== state.uid && (entry.lastSeenMs || 0) < cutoff
+  );
+
+  if (!stale.length) return;
+
   try {
-    const snapshot = await getDocs(
-      collection(
-        state.db,
-        FIREBASE_COLLECTIONS.rooms,
-        state.channel.id,
-        "presence"
+    await Promise.allSettled(
+      stale.map((entry) =>
+        deleteDoc(
+          doc(
+            state.db,
+            FIREBASE_COLLECTIONS.rooms,
+            channelId,
+            "presence",
+            entry.uid
+          )
+        )
       )
     );
-
-    const cutoff = Date.now() - STALE_PRESENCE_MS;
-    const deletions = snapshot.docs
-      .filter((item) => (item.data().lastSeenMs || 0) < cutoff)
-      .map((item) => deleteDoc(item.ref));
-
-    await Promise.allSettled(deletions);
   } catch (error) {
     console.warn("오래된 접속자 정리 실패", error);
   }
 }
 
-async function cleanupStaleMatch(channelId = state.channel?.id) {
+async function cleanupStaleMatch(
+  channelId = state.channel?.id,
+  { presenceByUid = null } = {}
+) {
   if (!state.firebaseReady || !channelId) return;
 
-  const matchRef = doc(
-    state.db,
-    FIREBASE_COLLECTIONS.matches,
-    channelId
-  );
-  const now = Date.now();
+  const matchRef = doc(state.db, FIREBASE_COLLECTIONS.matches, channelId);
+  const now = serverNow();
+  const hasPresence = presenceByUid !== null;
 
-  let presenceLastSeenByUid = {};
+  /*
+   * 모집 중 유령 판정.
+   * away는 20초의 유예를 둡니다. 알림을 잠깐 확인하고 돌아온 학생이
+   * 참여 자리를 잃지 않도록 하기 위해서입니다.
+   */
+  const isLobbyGhost = (uid) => {
+    if (!hasPresence || !uid) return false;
 
-  try {
-    const presenceSnapshot = await getDocs(
-      collection(
-        state.db,
-        FIREBASE_COLLECTIONS.rooms,
-        channelId,
-        "presence"
-      )
-    );
+    const presence = presenceByUid[uid];
+    if (!presence) return true;
+    if (presence.away && now - (presence.awayAtMs || 0) >= AWAY_GRACE_MS) {
+      return true;
+    }
 
-    presenceLastSeenByUid = Object.fromEntries(
-      presenceSnapshot.docs.map((item) => {
-        const data = item.data();
-        return [data.uid || item.id, Number(data.lastSeenMs || 0)];
-      })
-    );
-  } catch (error) {
-    console.warn("접속 상태를 이용한 유령 대결 확인 실패", error);
-  }
+    return now - (presence.lastSeenMs || 0) >= STALE_PRESENCE_MS;
+  };
 
   try {
     await runTransaction(state.db, async (transaction) => {
@@ -1039,12 +1180,20 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
 
       const match = snapshot.data();
 
+      /*
+       * 최종 안전망.
+       * 어떤 경로로 상태가 꼬이더라도 25분이 지난 문서는 무조건 삭제합니다.
+       * 20문제 대결은 아무리 늘어져도 이보다 짧습니다.
+       */
+      const createdAtMs = Number(match.createdAtMs || 0);
+      if (createdAtMs && now - createdAtMs >= MATCH_MAX_LIFETIME_MS) {
+        transaction.delete(matchRef);
+        return;
+      }
+
       if (match.status === "finished") {
         const finishedAtMs = Number(match.finishedAtMs || 0);
-        if (
-          finishedAtMs &&
-          now - finishedAtMs >= FINISHED_MATCH_RETENTION_MS
-        ) {
+        if (!finishedAtMs || now - finishedAtMs >= FINISHED_MATCH_RETENTION_MS) {
           transaction.delete(matchRef);
         }
         return;
@@ -1052,16 +1201,33 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
 
       if (match.status === "waiting") {
         const proposalTime = Number(
-          match.proposalUpdatedAtMs ||
-          match.createdAtMs ||
-          0
+          match.proposalUpdatedAtMs || match.createdAtMs || 0
         );
 
-        if (
-          proposalTime &&
-          now - proposalTime >= MATCH_INACTIVITY_LIMIT_MS
-        ) {
+        // 제안자가 사라졌으면 제안 자체를 정리합니다.
+        if (isLobbyGhost(match.hostUid)) {
           transaction.delete(matchRef);
+          return;
+        }
+
+        if (proposalTime && now - proposalTime >= MATCH_INACTIVITY_LIMIT_MS) {
+          transaction.delete(matchRef);
+          return;
+        }
+
+        /*
+         * 참여 목록에서 유령을 개별 제거합니다.
+         * 기존 코드에 이 처리가 없어서, 뒤로 가기로 나간 학생의 uid가
+         * acceptedPlayers에 영구히 남아 있었습니다.
+         */
+        const acceptedPlayers = { ...(match.acceptedPlayers || {}) };
+        const ghostUids = Object.keys(acceptedPlayers).filter(
+          (uid) => uid !== match.hostUid && isLobbyGhost(uid)
+        );
+
+        if (ghostUids.length) {
+          ghostUids.forEach((uid) => delete acceptedPlayers[uid]);
+          transaction.update(matchRef, { acceptedPlayers });
         }
         return;
       }
@@ -1080,33 +1246,44 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
       const eliminated = match.eliminated || {};
       const lastActivityAtMs = match.lastActivityAtMs || {};
       const fallbackStartTime = Number(
-        match.startedAtMs ||
-        match.startsAtMs ||
-        match.questionStartedAtMs ||
-        match.createdAtMs ||
-        0
+        match.startedAtMs || match.startsAtMs || match.createdAtMs || 0
       );
 
-      const inactiveIds = participantIds.filter((uid) => {
-        if (eliminated[uid]) return false;
+      const exitReasonByUid = {};
+
+      participantIds.forEach((uid) => {
+        if (eliminated[uid]) return;
 
         const activityTime = Number(
           lastActivityAtMs[uid] || fallbackStartTime || 0
         );
-        const presenceTime = Number(presenceLastSeenByUid[uid] || 0);
 
-        const answerInactive =
-          activityTime > 0 &&
-          now - activityTime >= MATCH_INACTIVITY_LIMIT_MS;
+        if (activityTime > 0 && now - activityTime >= MATCH_INACTIVITY_LIMIT_MS) {
+          exitReasonByUid[uid] = "inactive";
+          return;
+        }
 
-        const disconnectedLongEnough = presenceTime > 0
-          ? now - presenceTime >= DISCONNECTED_PLAYER_GRACE_MS
-          : fallbackStartTime > 0 &&
-            now - fallbackStartTime >= DISCONNECTED_PLAYER_GRACE_MS;
+        if (!hasPresence) return;
 
-        return answerInactive || disconnectedLongEnough;
+        /*
+         * 대결 중에는 away를 퇴장 사유로 쓰지 않습니다.
+         * 문제를 푸는 도중 알림을 확인하는 경우가 있기 때문입니다.
+         *
+         * presence 문서가 아예 없을 때 기존 코드는 대결 시작 시각을
+         * 기준으로 삼았습니다. 그래서 시작 후 3분이 지나면 정상 접속 중인
+         * 학생도 presence가 잠깐 비는 순간 즉시 탈락했습니다.
+         * 본인의 마지막 활동 시각을 기준으로 바꿔 이를 막습니다.
+         */
+        const presence = presenceByUid[uid];
+        const disconnected = presence
+          ? now - (presence.lastSeenMs || 0) >= DISCONNECTED_PLAYER_GRACE_MS
+          : activityTime > 0 &&
+            now - activityTime >= DISCONNECTED_PLAYER_GRACE_MS;
+
+        if (disconnected) exitReasonByUid[uid] = "disconnected";
       });
 
+      const inactiveIds = Object.keys(exitReasonByUid);
       if (!inactiveIds.length) return;
 
       const nextEliminated = { ...eliminated };
@@ -1116,7 +1293,7 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
         nextEliminated[uid] = true;
         updates[`eliminated.${uid}`] = true;
         updates[`eliminatedAtMs.${uid}`] = now;
-        updates[`exitReasons.${uid}`] = "inactive-3-minutes";
+        updates[`exitReasons.${uid}`] = exitReasonByUid[uid];
       });
 
       const remainingActiveCount = participantIds.filter(
@@ -1137,6 +1314,13 @@ async function cleanupStaleMatch(channelId = state.channel?.id) {
   }
 }
 
+/*
+ * 앱을 켤 때 한 번 도는 전체 훑기.
+ *
+ * 다른 방의 presence까지 읽으면 학생 수 x 방 수만큼 읽기가 발생하므로
+ * presence 없이 시간 기준 규칙(절대 수명, 종료 후 보관, 제안 방치)만
+ * 적용합니다. 유령 참가자 제거는 그 방에 실제로 들어간 학생이 처리합니다.
+ */
 async function cleanupAllStaleMatches() {
   if (!state.firebaseReady) return;
 
@@ -1145,25 +1329,42 @@ async function cleanupAllStaleMatches() {
   );
 }
 
-function startMatchCleanup() {
-  if (
-    !state.firebaseReady ||
-    !state.channel ||
-    state.matchCleanupId
-  ) {
-    return;
-  }
+function runRoomCleanupCycle() {
+  if (!state.firebaseReady || !state.channel) return;
 
-  cleanupStaleMatch().catch(console.warn);
-  state.matchCleanupId = window.setInterval(() => {
-    cleanupStaleMatch().catch(console.warn);
-  }, MATCH_CLEANUP_INTERVAL_MS);
+  /*
+   * 접속자 명단이 아직 도착하지 않았는데 정리를 돌리면
+   * 멀쩡한 참가자를 전부 유령으로 오판합니다. 스냅샷이 도착하고
+   * 그 안에 내 기록이 보일 때까지 기다립니다.
+   */
+  if (!state.presenceReady) return;
+  if (!state.presenceCache.some((entry) => entry.uid === state.uid)) return;
+
+  // 접속자 중 한 명만 정리를 수행합니다. (읽기/쓰기 할당량 보호)
+  if (!isDesignatedCleaner()) return;
+
+  cleanupStaleMatch(state.channel.id, {
+    presenceByUid: buildPresenceIndex()
+  }).catch(console.warn);
+
+  cleanupStalePresence().catch(console.warn);
+}
+
+function startMatchCleanup() {
+  if (!state.firebaseReady || !state.channel || state.matchCleanupId) return;
+
+  runRoomCleanupCycle();
+  state.matchCleanupId = window.setInterval(
+    runRoomCleanupCycle,
+    MATCH_CLEANUP_INTERVAL_MS
+  );
 }
 
 function subscribeToPresence() {
   if (!state.firebaseReady || !state.channel) return;
 
   state.presenceUnsubscribe?.();
+  state.presenceReady = false;
   const channelId = state.channel.id;
 
   state.presenceUnsubscribe = onSnapshot(
@@ -1176,9 +1377,32 @@ function subscribeToPresence() {
     (snapshot) => {
       if (state.channel?.id !== channelId) return;
 
-      const cutoff = Date.now() - PRESENCE_VISIBLE_MS;
-      state.onlineUsers = snapshot.docs
-        .map((item) => item.data())
+      // 내 문서의 서버 타임스탬프로 시계 보정
+      const mine = snapshot.docs.find((item) => item.id === state.uid);
+      if (mine && !mine.metadata.hasPendingWrites) {
+        syncServerOffset(mine.data().lastSeen);
+      }
+
+      /*
+       * 정리 작업이 참고할 원본 캐시.
+       * 이걸 들고 있으면 청소할 때마다 getDocs로 다시 읽지 않아도 됩니다.
+       */
+      state.presenceCache = snapshot.docs.map((item) => {
+        const data = item.data();
+        return {
+          uid: data.uid || item.id,
+          nickname: data.nickname || "",
+          mode: data.mode || "idle",
+          away: data.away === true,
+          awayAtMs: Number(data.awayAtMs || 0),
+          lastSeenMs: Number(data.lastSeenMs || 0)
+        };
+      });
+
+      state.presenceReady = true;
+
+      const cutoff = serverNow() - PRESENCE_VISIBLE_MS;
+      state.onlineUsers = state.presenceCache
         .filter((user) => (user.lastSeenMs || 0) >= cutoff)
         .sort((first, second) =>
           String(first.nickname || "").localeCompare(
@@ -1233,11 +1457,11 @@ function subscribeToMatch() {
       const eliminatedAtMs = match.eliminatedAtMs?.[state.uid] || 0;
       const recentlyEliminated =
         eliminatedAtMs > 0 &&
-        Date.now() - eliminatedAtMs < RECENT_EVENT_WINDOW_MS;
+        serverNow() - eliminatedAtMs < RECENT_EVENT_WINDOW_MS;
       const finishedAtMs = match.finishedAtMs || 0;
       const recentlyFinished =
         finishedAtMs > 0 &&
-        Date.now() - finishedAtMs < RECENT_EVENT_WINDOW_MS;
+        serverNow() - finishedAtMs < RECENT_EVENT_WINDOW_MS;
 
       if (
         match.status === "playing" &&
@@ -1376,6 +1600,17 @@ function renderOnlineUsers() {
       let label = modeLabels[user.mode] || "대기 중";
       let tagClass = "";
 
+      if (user.away) {
+        label = "자리 비움";
+        tagClass = " not-accepted";
+        return `
+        <li>
+          <strong>${escapeHtml(user.nickname || "익명")}</strong>
+          <span class="mode-tag${tagClass}">${escapeHtml(label)}</span>
+        </li>
+      `;
+      }
+
       if (waitingMatch) {
         if (user.mode === "solo") {
           label = acceptedPlayers[user.uid]
@@ -1405,6 +1640,7 @@ function getActiveAcceptedUsers(match = state.match) {
   return state.onlineUsers.filter(
     (user) =>
       user.mode !== "solo" &&
+      user.away !== true &&
       Boolean(acceptedPlayers[user.uid])
   );
 }
@@ -1555,7 +1791,7 @@ async function proposeBattle(difficulty) {
   }
 
   const roundId = crypto.randomUUID();
-  const now = Date.now();
+  const now = serverNow();
   const matchRef = doc(
     state.db,
     FIREBASE_COLLECTIONS.matches,
@@ -1735,7 +1971,7 @@ async function startAcceptedBattle() {
     FIREBASE_COLLECTIONS.matches,
     state.channel.id
   );
-  const battleStartTime = Date.now();
+  const battleStartTime = serverNow();
 
   try {
     await runTransaction(state.db, async (transaction) => {
@@ -1831,7 +2067,7 @@ function renderBattle() {
   elements.battleNumber.textContent = question.display;
   elements.difficultyPill.textContent = match.difficulty.toUpperCase();
 
-  const now = Date.now();
+  const now = serverNow();
   const secondsLeft = Math.ceil((match.startsAtMs - now) / 1000);
   const winnerExists = Boolean(match.questionWinnerUid);
 
@@ -1909,7 +2145,7 @@ async function advanceQuestion(roundId, questionIndex) {
     }
 
     if (questionIndex >= 19) {
-      const now = Date.now();
+      const now = serverNow();
       const updates = {
         status: "finished",
         finishedAt: serverTimestamp(),
@@ -1936,7 +2172,7 @@ async function advanceQuestion(roundId, questionIndex) {
       questionIndex: questionIndex + 1,
       questionWinnerUid: null,
       questionWinnerNickname: null,
-      questionStartedAtMs: Date.now()
+      questionStartedAtMs: serverNow()
     });
   });
 }
@@ -1964,7 +2200,7 @@ async function recordInvalidSubmissionActivity(match) {
     }
 
     transaction.update(matchRef, {
-      [`lastActivityAtMs.${state.uid}`]: Date.now(),
+      [`lastActivityAtMs.${state.uid}`]: serverNow(),
       [`hasSubmitted.${state.uid}`]: true
     });
   });
@@ -1983,7 +2219,7 @@ async function submitBattleAnswer(event) {
     return;
   }
 
-  if (Date.now() < match.startsAtMs || match.questionWinnerUid) return;
+  if (serverNow() < match.startsAtMs || match.questionWinnerUid) return;
 
   const rawAnswer = elements.battleAnswerInput.value;
   if (!isHangulOnlyAnswer(rawAnswer)) {
@@ -2025,7 +2261,7 @@ async function submitBattleAnswer(event) {
         return { type: "stale" };
       }
 
-      const now = Date.now();
+      const now = serverNow();
       const activityUpdates = {
         [`lastActivityAtMs.${state.uid}`]: now,
         [`hasSubmitted.${state.uid}`]: true
@@ -2175,12 +2411,15 @@ function renderScores() {
 
 function getExitReasonLabel(reason) {
   const labels = {
-    "inactive-3-minutes": "3분 무입력 퇴장",
+    inactive: "무입력 퇴장",
+    disconnected: "접속 끊김",
+    "inactive-3-minutes": "무입력 퇴장",
     "no-submission-by-finish": "미참여 종료",
     "hard-mistake": "Hard 탈락",
     "left-intentionally": "중도 퇴장",
     "abandoned-previous-match": "이전 대결 포기",
-    "duplicate-session-cleanup": "중복 참여 정리"
+    "duplicate-session-cleanup": "중복 참여 정리",
+    "stale-session-auto-cleanup": "이전 기록 자동 정리"
   };
 
   return labels[reason] || "퇴장";
@@ -2196,13 +2435,19 @@ async function handleElimination(match) {
   const score = match.scores?.[state.uid] || 0;
   const reason = match.exitReasons?.[state.uid];
   const description =
-    reason === "inactive-3-minutes"
+    reason === "inactive" || reason === "inactive-3-minutes"
       ? "3분 동안 답을 제출하지 않아 대결에서 자동 퇴장되었습니다."
-      : reason === "hard-mistake"
-        ? "0점인 상태에서 오답을 입력해 대결에서 퇴장되었습니다."
-        : "대결에서 퇴장 처리되었습니다.";
+      : reason === "disconnected"
+        ? "접속이 끊긴 것으로 확인되어 대결에서 자동 퇴장되었습니다."
+        : reason === "hard-mistake"
+          ? "0점인 상태에서 오답을 입력해 대결에서 퇴장되었습니다."
+          : "대결에서 퇴장 처리되었습니다.";
   const eyebrow =
-    reason === "inactive-3-minutes" ? "INACTIVITY" : "BATTLE EXIT";
+    reason === "inactive" ||
+    reason === "inactive-3-minutes" ||
+    reason === "disconnected"
+      ? "AUTO EXIT"
+      : "BATTLE EXIT";
 
   await clearRoomState({ closeCurrentModal: false });
   returnHistoryToChannels();
@@ -2257,7 +2502,7 @@ function getFinishedRoundCopy(match) {
     case "all-players-inactive":
       return {
         title: "대결이 자동 종료되었습니다.",
-        description: "모든 참가자가 3분 동안 답을 제출하지 않아 대결이 종료되었습니다."
+        description: "활동 중인 참가자가 모두 접속을 끊거나 답을 제출하지 않아 대결이 종료되었습니다."
       };
     case "all-players-eliminated":
       return {
@@ -2404,8 +2649,14 @@ window.addEventListener("popstate", async () => {
   const channelId = state.channel.id;
   history.pushState({ screen: "room", channelId }, "", location.href);
 
+  /*
+   * 뒤로 가기에서는 확인 창을 띄우지 않습니다.
+   * 모바일 브라우저가 대화 상자를 차단하면 window.confirm이 false를
+   * 반환해, 퇴장 기록 없이 조용히 유령이 되는 경로가 있었습니다.
+   */
   const leftRoom = await requestIntentionalRoomExit({
-    navigateHistory: false
+    navigateHistory: false,
+    confirmFirst: false
   });
 
   if (leftRoom) {
@@ -2415,19 +2666,26 @@ window.addEventListener("popstate", async () => {
 
 window.addEventListener("pageshow", () => {
   if (state.channel && state.firebaseReady) {
+    markPresenceAway(false);
     heartbeatOnce().catch(console.warn);
   }
 });
 
+window.addEventListener("pagehide", () => {
+  markPresenceAway(true);
+});
+
 document.addEventListener("visibilitychange", () => {
-  if (
-    document.visibilityState === "visible" &&
-    state.channel &&
-    state.firebaseReady
-  ) {
-    heartbeatOnce().catch(console.warn);
-    cleanupStaleMatch().catch(console.warn);
+  if (!state.channel || !state.firebaseReady) return;
+
+  if (document.visibilityState === "hidden") {
+    markPresenceAway(true);
+    return;
   }
+
+  markPresenceAway(false);
+  heartbeatOnce().catch(console.warn);
+  runRoomCleanupCycle();
 });
 
 history.replaceState({ screen: "channels" }, "", location.href);
