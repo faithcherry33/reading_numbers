@@ -55,7 +55,7 @@ const MATCH_INACTIVITY_LIMIT_MS = 3 * 60 * 1000;
 const MATCH_CLEANUP_INTERVAL_MS = 15 * 1000;
 const RECENT_EVENT_WINDOW_MS = 90 * 1000;
 const FINISHED_MATCH_RETENTION_MS = 3 * 60 * 1000;
-const MATCH_MAX_LIFETIME_MS = 25 * 60 * 1000;
+const MATCH_MAX_IDLE_MS = 4 * 60 * 1000;
 const SESSION_RESUME_WINDOW_MS = 90 * 1000;
 const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000;
 
@@ -1204,10 +1204,30 @@ async function cleanupStaleMatch(
 
       /*
        * 최종 안전망.
-       * 어떤 경로로 상태가 꼬이더라도 25분이 지난 문서는 무조건 삭제합니다.
-       * 20문제 대결은 아무리 늘어져도 이보다 짧습니다.
+       *
+       * 생성 시각이 아니라 '마지막으로 무슨 일이든 일어난 시각'을 기준으로
+       * 잽니다. 진행 중인 대결은 학생이 답을 낼 때마다 이 시각이 갱신되므로
+       * 아무리 오래 걸려도 중간에 삭제되지 않습니다. 반대로 완전히 멈춘
+       * 문서는 상태와 무관하게 4분이면 사라집니다.
        */
-      if (isExpired(match.createdAtMs, MATCH_MAX_LIFETIME_MS, now)) {
+      const activityTimes = [
+        match.createdAtMs,
+        match.proposalUpdatedAtMs,
+        match.startedAtMs,
+        match.questionStartedAtMs,
+        match.answerReceivedAtMs,
+        match.finishedAtMs,
+        ...Object.values(match.lastActivityAtMs || {}),
+        ...Object.values(match.eliminatedAtMs || {})
+      ]
+        .map(Number)
+        .filter((value) => Number.isFinite(value) && value > 0);
+
+      const lastAnyActivity = activityTimes.length
+        ? Math.max(...activityTimes)
+        : 0;
+
+      if (isExpired(lastAnyActivity, MATCH_MAX_IDLE_MS, now)) {
         transaction.delete(matchRef);
         return;
       }
